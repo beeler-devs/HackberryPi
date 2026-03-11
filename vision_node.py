@@ -2,8 +2,8 @@
 """
 vision_node.py — Jetson Nano Vision Node
 Captures frames at 100fps via Arducam OV9782, detects Aimlabs targets via
-HSV color thresholding, and transmits centroid + crosshair coordinates over UDP
-to the Raspberry Pi control node.
+HSV color thresholding, and transmits X-axis centroid + crosshair coordinates
+over UDP to the Raspberry Pi control node (Y-axis is user-controlled).
 
 Latency priorities:
   - MJPEG over V4L2 to minimize USB bandwidth
@@ -35,7 +35,6 @@ EXPOSURE_VALUE    = 100
 # Physical center of your monitor as seen by the camera (in pixels).
 # Measure once by overlaying a crosshair image and noting the pixel coords.
 CROSSHAIR_X       = 320.0
-CROSSHAIR_Y       = 240.0
 
 # ── HSV target color bounds ───────────────────────────────────────────────────
 # Aimlabs default target color is cyan/teal. OpenCV HSV: H[0,179] S[0,255] V[0,255].
@@ -166,15 +165,14 @@ class VisionProcessor:
         self._sock.settimeout(0.001)   # 1ms timeout; drop rather than stall
         self._dest = (UDP_TARGET_IP, UDP_TARGET_PORT)
 
-        # Static crosshair as numpy arrays for fast distance computation.
+        # Static crosshair X position for distance computation.
         self._cx = CROSSHAIR_X
-        self._cy = CROSSHAIR_Y
 
     # ── Core vision pipeline ──────────────────────────────────────────────────
     def process_frame(self, frame: np.ndarray):
         """
         Run the full detection pipeline on a single BGR frame.
-        Returns (target_x, target_y) in pixels, or None if no target found.
+        Returns target_x in pixels, or None if no target found.
         All operations use pre-allocated buffers to avoid heap allocation.
         """
         # Step 1: BGR → HSV in-place. dst= reuses self._hsv_buf allocation.
@@ -212,20 +210,18 @@ class VisionProcessor:
                 if M['m00'] == 0:
                     return float('inf')
                 px = M['m10'] / M['m00']
-                py = M['m01'] / M['m00']
-                return (px - self._cx) ** 2 + (py - self._cy) ** 2
+                return (px - self._cx) ** 2
             best = min(valid, key=sq_dist)
         else:
             # 'largest': fastest; fine when only one target is visible at a time.
             best = max(valid, key=cv2.contourArea)
 
-        # Step 7: Compute centroid via image moments.
+        # Step 7: Compute X centroid via image moments.
         M = cv2.moments(best)
         if M['m00'] == 0:
             return None   # degenerate contour (all pixels on one line)
         tx = M['m10'] / M['m00']
-        ty = M['m01'] / M['m00']
-        return (tx, ty)
+        return tx
 
     # ── Main processing loop ──────────────────────────────────────────────────
     def run(self) -> None:
@@ -251,17 +247,17 @@ class VisionProcessor:
                     cv2.waitKey(1)
                 continue
 
-            tx, ty = result
+            tx = result
             ts = time.monotonic()   # seconds; used by Pi for staleness check
 
-            # Pack as big-endian binary: 8+4+4+4+4 = 24 bytes total.
-            # Format: double timestamp | float cx | float cy | float tx | float ty
-            # (cx/cy = crosshair static center; tx/ty = target centroid)
+            # Pack as big-endian binary: 8+4+4 = 16 bytes total.
+            # Format: double timestamp | float tx | float cx
+            # (cx = crosshair static X center; tx = target centroid X)
             packet = struct.pack(
-                '!dffff',
+                '!dff',
                 ts,
-                tx, ty,                  # target centroid
-                self._cx, self._cy       # crosshair reference (static)
+                tx,           # target centroid X
+                self._cx      # crosshair reference X (static)
             )
             try:
                 self._sock.sendto(packet, self._dest)
@@ -269,10 +265,11 @@ class VisionProcessor:
                 pass   # timeout or network error — drop and continue
 
             if DEBUG_SHOW:
-                # Draw crosshair and target on the mask for visual calibration.
+                # Draw crosshair and target X positions on the mask for visual calibration.
                 dbg = cv2.cvtColor(self._mask_buf, cv2.COLOR_GRAY2BGR)
-                cv2.circle(dbg, (int(tx), int(ty)), 5, (0, 255, 0), -1)
-                cv2.circle(dbg, (int(self._cx), int(self._cy)), 3, (0, 0, 255), -1)
+                mid_y = CAPTURE_HEIGHT // 2
+                cv2.circle(dbg, (int(tx), mid_y), 5, (0, 255, 0), -1)
+                cv2.circle(dbg, (int(self._cx), mid_y), 3, (0, 0, 255), -1)
                 cv2.imshow("mask", dbg)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     self._running = False

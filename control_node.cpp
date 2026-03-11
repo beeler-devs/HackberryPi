@@ -1,8 +1,9 @@
 /*
  * control_node.cpp — Raspberry Pi 4/5 Control Node
  *
- * Receives 24-byte UDP packets from the Jetson vision node, runs a state-driven
- * PID controller, and drives a servo (X+Y) + solenoid trigger via pigpio.
+ * Receives 16-byte UDP packets from the Jetson vision node, runs a state-driven
+ * PID controller for X-axis, and drives a servo + solenoid trigger via pigpio.
+ * Y-axis is user-controlled.
  *
  * Build:  see build.sh
  * Run:    sudo ./control_node   (pigpio requires /dev/mem access → root)
@@ -35,7 +36,6 @@
 // GPIO 12 and 13 are hardware PWM-capable (ALT0 on Raspberry Pi 4/5).
 // pigpio's gpioServo() manages the 50Hz PWM signal in the kernel; no busy-wait needed.
 static constexpr int PIN_SERVO_X  = 12;   // Header pin 32
-static constexpr int PIN_SERVO_Y  = 13;   // Header pin 33
 static constexpr int PIN_TRIGGER  = 17;   // Header pin 11 → MOSFET gate → solenoid
 
 // ── Servo PWM Parameters ─────────────────────────────────────────────────────
@@ -114,7 +114,7 @@ static constexpr int TRIGGER_RANGE_MS = 30;   // → total range [30, 60] ms
 
 // ── Network ───────────────────────────────────────────────────────────────────
 static constexpr int   UDP_PORT       = 5005;
-static constexpr int   PACKET_SIZE    = 24;    // must match vision_node.py struct '!dffff'
+static constexpr int   PACKET_SIZE    = 16;    // must match vision_node.py struct '!dff'
 
 // Staleness threshold: discard packets older than this many seconds.
 // NOTE: Jetson and Pi monotonic clocks are independent. Sync with chrony+PTP for
@@ -130,15 +130,13 @@ static constexpr long LOOP_PERIOD_NS = 1000000L;
 // Data structures
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Binary layout of incoming UDP packet from vision_node.py struct.pack('!dffff').
+// Binary layout of incoming UDP packet from vision_node.py struct.pack('!dff').
 // All fields are big-endian; must convert to host order after recv().
 #pragma pack(push, 1)
 struct VisionPacket {
     double timestamp_s;   // bytes  0-7:  time.monotonic() on Jetson (big-endian double)
     float  cx;            // bytes  8-11: target centroid X (big-endian float)
-    float  cy;            // bytes 12-15: target centroid Y (big-endian float)
-    float  tx;            // bytes 16-19: crosshair X (big-endian float, static reference)
-    float  ty;            // bytes 20-23: crosshair Y (big-endian float, static reference)
+    float  tx;            // bytes 12-15: crosshair X (big-endian float, static reference)
 };
 #pragma pack(pop)
 
@@ -146,15 +144,12 @@ enum class ControlState : uint8_t { FLICK, SETTLE };
 
 struct PIDState {
     float integral_x    = 0.0f;
-    float integral_y    = 0.0f;
     float prev_error_x  = 0.0f;
-    float prev_error_y  = 0.0f;
     ControlState state  = ControlState::FLICK;
 };
 
 struct ControlOutput {
     float servo_x_us;   // servo X pulse width in µs [500, 2500]
-    float servo_y_us;   // servo Y pulse width in µs [500, 2500]
     bool  fire;         // true = trigger solenoid
 };
 
@@ -238,9 +233,7 @@ static bool deserialize_packet(const uint8_t* buf, ssize_t len, VisionPacket& ou
     };
 
     out.cx = read_f32(buf +  8);
-    out.cy = read_f32(buf + 12);
-    out.tx = read_f32(buf + 16);
-    out.ty = read_f32(buf + 20);
+    out.tx = read_f32(buf + 12);
     return true;
 }
 
@@ -249,27 +242,26 @@ static bool deserialize_packet(const uint8_t* buf, ssize_t len, VisionPacket& ou
 // ─────────────────────────────────────────────────────────────────────────────
 
 /*
- * compute_pid — core control law.
+ * compute_pid — core X-axis control law.
  *
  * Parameters:
- *   pid     — mutable state (integrals, previous errors, current state enum)
+ *   pid     — mutable state (integral, previous error, current state enum)
  *   error_x — signed pixel offset: target_x - crosshair_x (positive = target right)
- *   error_y — signed pixel offset: target_y - crosshair_y (positive = target below)
  *   dt_s    — elapsed time since last call, in seconds (from CLOCK_MONOTONIC)
  *
- * Returns ControlOutput with servo pulse widths and fire flag.
+ * Returns ControlOutput with servo pulse width and fire flag.
  *
  * State machine summary:
  *
  *   ┌─────────────────────────────────────────────────────────────┐
  *   │ Target Switch Detection                                      │
- *   │ If |Δerror_x| > 50px OR |Δerror_y| > 50px:                 │
- *   │   → Reset integrals to 0                                     │
+ *   │ If |Δerror_x| > 50px:                                       │
+ *   │   → Reset integral to 0                                      │
  *   │   → Set prev_error = current (prevents derivative kick)      │
  *   │   → Force FLICK state                                        │
  *   └──────────────────────┬──────────────────────────────────────┘
  *                          │
- *          dist > 30px ────┴──── dist < 30px
+ *        |err| > 30px ─────┴───── |err| < 30px
  *               │                      │
  *           FLICK state           SETTLE state
  *        (PD control only)       (full PID control)
@@ -278,25 +270,19 @@ static bool deserialize_packet(const uint8_t* buf, ssize_t len, VisionPacket& ou
  *               │                      │
  *               └──────────┬───────────┘
  *                          │
- *              dist < 5px → fire = true
+ *            |err| < 5px → fire = true
  */
 static ControlOutput compute_pid(PIDState& pid,
-                                  float error_x, float error_y,
+                                  float error_x,
                                   float dt_s) {
-    float dist = std::sqrt(error_x * error_x + error_y * error_y);
+    float dist = std::abs(error_x);
 
     // ── Target Switch Detection ───────────────────────────────────────────────
-    // A sudden large jump in the error vector indicates a new target spawned.
-    // We must reset the integral to prevent windup artifacts from the old target,
-    // and reset prev_error to prevent a false derivative spike.
     float delta_x = std::abs(error_x - pid.prev_error_x);
-    float delta_y = std::abs(error_y - pid.prev_error_y);
-    if (delta_x > TARGET_SWITCH_PX || delta_y > TARGET_SWITCH_PX) {
-        pid.integral_x  = 0.0f;
-        pid.integral_y  = 0.0f;
+    if (delta_x > TARGET_SWITCH_PX) {
+        pid.integral_x   = 0.0f;
         pid.prev_error_x = error_x;
-        pid.prev_error_y = error_y;
-        pid.state = ControlState::FLICK;   // always flick to a new target
+        pid.state = ControlState::FLICK;
     }
 
     // ── State Transition ──────────────────────────────────────────────────────
@@ -306,46 +292,28 @@ static ControlOutput compute_pid(PIDState& pid,
         pid.state = ControlState::SETTLE;
     }
 
-    float output_x, output_y;
-    float safe_dt = (dt_s > 1e-6f) ? dt_s : 1e-6f;   // prevent division by near-zero
+    float output_x;
+    float safe_dt = (dt_s > 1e-6f) ? dt_s : 1e-6f;
 
     if (pid.state == ControlState::FLICK) {
-        // ── FLICK: PD only ────────────────────────────────────────────────────
-        // Integral is intentionally excluded: we are nowhere near the target, and
-        // any accumulated integral from the previous settle would cause overshoot.
         float deriv_x = (error_x - pid.prev_error_x) / safe_dt;
-        float deriv_y = (error_y - pid.prev_error_y) / safe_dt;
         output_x = Kp_flick * error_x + Kd_flick * deriv_x;
-        output_y = Kp_flick * error_y + Kd_flick * deriv_y;
-        // Do NOT accumulate integral during flick.
     } else {
-        // ── SETTLE: full PID ──────────────────────────────────────────────────
-        // Accumulate integral, clamped to prevent windup.
         pid.integral_x = std::clamp(pid.integral_x + error_x * dt_s,
                                     -INTEGRAL_CLAMP, INTEGRAL_CLAMP);
-        pid.integral_y = std::clamp(pid.integral_y + error_y * dt_s,
-                                    -INTEGRAL_CLAMP, INTEGRAL_CLAMP);
         float deriv_x = (error_x - pid.prev_error_x) / safe_dt;
-        float deriv_y = (error_y - pid.prev_error_y) / safe_dt;
         output_x = Kp_settle * error_x
                  + Ki_settle * pid.integral_x
                  + Kd_settle * deriv_x;
-        output_y = Kp_settle * error_y
-                 + Ki_settle * pid.integral_y
-                 + Kd_settle * deriv_y;
     }
 
     pid.prev_error_x = error_x;
-    pid.prev_error_y = error_y;
 
     // ── Map PID Output to Servo Pulse Width ───────────────────────────────────
-    // pulse_us = center(1500) + output * scale, clamped to valid servo range.
     float servo_x_us = std::clamp(SERVO_CENTER_US + output_x * PID_TO_US_SCALE,
                                   SERVO_MIN_US, SERVO_MAX_US);
-    float servo_y_us = std::clamp(SERVO_CENTER_US + output_y * PID_TO_US_SCALE,
-                                  SERVO_MIN_US, SERVO_MAX_US);
 
-    return { servo_x_us, servo_y_us, dist < FIRE_THRESHOLD_PX };
+    return { servo_x_us, dist < FIRE_THRESHOLD_PX };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -400,12 +368,10 @@ int main() {
     }
 
     gpioSetMode(PIN_SERVO_X, PI_OUTPUT);
-    gpioSetMode(PIN_SERVO_Y, PI_OUTPUT);
     gpioSetMode(PIN_TRIGGER, PI_OUTPUT);
 
-    // Safe initial state: servos centered, trigger off.
+    // Safe initial state: servo centered, trigger off.
     gpioServo(PIN_SERVO_X, static_cast<unsigned>(SERVO_CENTER_US));
-    gpioServo(PIN_SERVO_Y, static_cast<unsigned>(SERVO_CENTER_US));
     gpioWrite(PIN_TRIGGER, 0);
 
     std::srand(static_cast<unsigned>(time(nullptr)));
@@ -427,7 +393,7 @@ int main() {
     }
 
     // Optional: SO_RCVBUF — default is usually 212992 bytes on Linux, sufficient
-    // for buffering a few 24-byte packets. Not tuned further here.
+    // for buffering a few 16-byte packets. Not tuned further here.
 
     struct sockaddr_in addr{};
     addr.sin_family      = AF_INET;
@@ -441,8 +407,8 @@ int main() {
     }
 
     std::printf("[INFO] Control node listening on UDP port %d\n", UDP_PORT);
-    std::printf("[INFO] Servo X: GPIO%d | Servo Y: GPIO%d | Trigger: GPIO%d\n",
-                PIN_SERVO_X, PIN_SERVO_Y, PIN_TRIGGER);
+    std::printf("[INFO] Servo X: GPIO%d | Trigger: GPIO%d\n",
+                PIN_SERVO_X, PIN_TRIGGER);
     std::printf("[INFO] PID Flick  — Kp=%.2f Kd=%.2f\n", Kp_flick, Kd_flick);
     std::printf("[INFO] PID Settle — Kp=%.2f Ki=%.3f Kd=%.2f\n",
                 Kp_settle, Ki_settle, Kd_settle);
@@ -451,9 +417,9 @@ int main() {
     PIDState pid{};
     uint8_t  recv_buf[PACKET_SIZE];
 
-    // Last known target position (used to hold servo position between packets).
-    float    last_tx = 0.0f, last_ty = 0.0f;   // target centroid
-    float    last_cx = 0.0f, last_cy = 0.0f;   // crosshair reference
+    // Last known target X position (used to hold servo position between packets).
+    float    last_tx = 0.0f;   // target centroid X
+    float    last_cx = 0.0f;   // crosshair reference X
     bool     have_target = false;
 
     double   prev_time = mono_seconds();
@@ -476,9 +442,7 @@ int main() {
                 double age = now - pkt.timestamp_s;
                 if (age < PACKET_STALE_S && age > -1.0) {   // -1.0 allows minor clock skew
                     last_tx = pkt.cx;
-                    last_ty = pkt.cy;
                     last_cx = pkt.tx;
-                    last_cy = pkt.ty;
                     have_target = true;
                 }
             }
@@ -488,15 +452,12 @@ int main() {
         // ── Control law ───────────────────────────────────────────────────────
         if (have_target) {
             // error: positive X = target is to the right of crosshair
-            //        positive Y = target is below crosshair
             float error_x = last_tx - last_cx;
-            float error_y = last_ty - last_cy;
 
-            ControlOutput out = compute_pid(pid, error_x, error_y, dt);
+            ControlOutput out = compute_pid(pid, error_x, dt);
 
             // gpioServo truncates to int µs internally; cast is safe within [500,2500].
             gpioServo(PIN_SERVO_X, static_cast<unsigned>(out.servo_x_us));
-            gpioServo(PIN_SERVO_Y, static_cast<unsigned>(out.servo_y_us));
 
             if (out.fire) {
                 maybe_fire();
@@ -513,9 +474,8 @@ int main() {
     // ── Cleanup ───────────────────────────────────────────────────────────────
     std::printf("\n[INFO] Shutting down...\n");
 
-    // Safe stop: center servos, ensure trigger is off.
+    // Safe stop: center servo, ensure trigger is off.
     gpioServo(PIN_SERVO_X, static_cast<unsigned>(SERVO_CENTER_US));
-    gpioServo(PIN_SERVO_Y, static_cast<unsigned>(SERVO_CENTER_US));
     gpioWrite(PIN_TRIGGER, 0);
 
     // Brief delay to allow any in-flight trigger thread to complete.
