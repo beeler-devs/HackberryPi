@@ -237,8 +237,8 @@ static bool deserialize_packet(const uint8_t* buf, ssize_t len, VisionPacket& ou
         return f;
     };
 
-    out.cx = read_f32(buf +  8);
-    out.tx = read_f32(buf + 12);
+    out.tx = read_f32(buf +  8);
+    out.cx = read_f32(buf + 12);
     return true;
 }
 
