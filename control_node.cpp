@@ -354,6 +354,9 @@ static void maybe_fire() {
     // exchange returns the old value. If it was already true, another thread is running.
     if (trigger_active.exchange(true)) return;
 
+    std::printf("[DEBUG] Solenoid firing\n");
+    std::fflush(stdout);
+
     std::thread([]() {
         gpioWrite(PIN_TRIGGER, 1);
         // Randomized dwell: uniform in [TRIGGER_MIN_MS, TRIGGER_MIN_MS + TRIGGER_RANGE_MS].
@@ -363,6 +366,8 @@ static void maybe_fire() {
         );
         gpioDelay(dwell_us);
         gpioWrite(PIN_TRIGGER, 0);
+        std::printf("[DEBUG] Solenoid released (dwell=%u ms)\n", dwell_us / 1000);
+        std::fflush(stdout);
         trigger_active.store(false);   // allow next fire
     }).detach();
 }
@@ -439,6 +444,7 @@ int main() {
     double   prev_time = mono_seconds();
     uint64_t recv_count = 0;
     uint64_t stale_count = 0;
+    bool     servo_was_active = false;  // for debug: track activation transitions
 
     // ── 1kHz control loop ─────────────────────────────────────────────────────
     while (g_running) {
@@ -473,6 +479,20 @@ int main() {
         if (have_target) {
             // error: positive X = target is to the right of crosshair
             float error_x = last_tx - last_cx;
+            float dist = std::abs(error_x);
+            bool servo_active = (dist <= ACTIVATION_RANGE_PX);
+
+            // Debug: log servo activation / deactivation transitions
+            if (servo_active && !servo_was_active) {
+                std::printf("[DEBUG] Servo activated (target in range, dist=%.1f px)\n",
+                            dist);
+                std::fflush(stdout);
+            } else if (!servo_active && servo_was_active) {
+                std::printf("[DEBUG] Servo deactivated (target out of range, dist=%.1f px)\n",
+                            dist);
+                std::fflush(stdout);
+            }
+            servo_was_active = servo_active;
 
             ControlOutput out = compute_pid(pid, error_x, dt);
 
