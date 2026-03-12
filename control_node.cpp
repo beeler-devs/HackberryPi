@@ -95,6 +95,11 @@ static constexpr float INTEGRAL_CLAMP = 200.0f;
 // Increase if the settle state isn't reached; decrease if flick overshoots.
 static constexpr float FLICK_THRESHOLD_PX = 30.0f;
 
+// Distance (pixels) within which the servo activates.
+// If the error is larger than this, the servo holds center and waits for the
+// user to manually bring the crosshair closer to the target.
+static constexpr float ACTIVATION_RANGE_PX = 50.0f;
+
 // Distance (pixels) below which the solenoid trigger fires.
 // Decrease for more accurate clicks (requires mechanical rig to be precise enough).
 // Increase if shots are being missed because the servo hasn't fully settled.
@@ -276,6 +281,15 @@ static ControlOutput compute_pid(PIDState& pid,
                                   float error_x,
                                   float dt_s) {
     float dist = std::abs(error_x);
+
+    // ── Activation Range Check ───────────────────────────────────────────────
+    // If the target is outside the activation range, hold servo at center
+    // and let the user bring the crosshair closer manually.
+    if (dist > ACTIVATION_RANGE_PX) {
+        pid.integral_x   = 0.0f;
+        pid.prev_error_x = error_x;
+        return { SERVO_CENTER_US, false };
+    }
 
     // ── Target Switch Detection ───────────────────────────────────────────────
     float delta_x = std::abs(error_x - pid.prev_error_x);
