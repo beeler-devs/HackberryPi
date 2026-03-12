@@ -20,7 +20,7 @@ def try_open_camera():
             ("ANY", cv2.CAP_ANY),
         ]
     mjpeg = cv2.VideoWriter_fourcc(*'MJPG')
-    for idx in range(1, 4):
+    for idx in range(0, 4):
         for name, backend in backends:
             print(f"  Trying index={idx}, backend={name}...", flush=True)
             cap = cv2.VideoCapture(idx, backend)

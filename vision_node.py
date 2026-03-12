@@ -20,6 +20,7 @@ import threading
 import queue
 import time
 import sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ── Camera ───────────────────────────────────────────────────────────────────
 CAMERA_INDEX      = 0        # /dev/video0  (change if camera is on another index)
@@ -28,8 +29,9 @@ CAPTURE_HEIGHT    = 480      # pixels; use 720 for higher accuracy at FPS cost
 CAPTURE_FPS       = 100      # OV9782 max; driver must negotiate MJPEG at this rate
 # V4L2 manual exposure value in device-specific units.
 # 100 ≈ 1ms on most V4L2 drivers (check with v4l2-ctl --list-ctrls on your device).
-# Decrease to reduce motion blur; increase if image is too dark.
-EXPOSURE_VALUE    = 100
+# Decrease to reduce motion blur; increase if image is too dark. If the overlay stream
+# looks black with only the red crosshair visible, raise this (e.g. 500–2000 for indoors).
+EXPOSURE_VALUE    = 800
 
 # ── Static crosshair ─────────────────────────────────────────────────────────
 # Physical center of your monitor as seen by the camera (in pixels).
@@ -74,6 +76,15 @@ CAPTURE_QUEUE_MAXSIZE = 2
 # ── Debug (disable in production — imshow costs ~5ms per frame) ───────────────
 DEBUG_SHOW = False   # set True to open an OpenCV window showing the HSV mask
 
+# ── Overlay stream (view CV overlay in browser on Mac/other device) ───────────
+# When True, serves MJPEG at http://<jetson-ip>:STREAM_PORT — open in browser to see overlay.
+STREAM_OVERLAY = True
+STREAM_PORT   = 8080
+STREAM_FPS    = 15   # max overlay frames per second (lower = less bandwidth)
+STREAM_JPEG_QUALITY = 85  # 1–100; lower = smaller frames, faster
+
+# Shared state for overlay stream: latest JPEG bytes + lock (written by VisionProcessor).
+_stream_overlay_buffer = {"jpeg": None, "lock": threading.Lock()}
 
 # ─────────────────────────────────────────────────────────────────────────────
 class FrameGrabber(threading.Thread):
@@ -238,6 +249,22 @@ class VisionProcessor:
 
             result = self.process_frame(frame)
 
+            # Optional: build overlay and feed MJPEG stream for browser viewing (e.g. on Mac).
+            if STREAM_OVERLAY:
+                overlay = frame.copy()
+                mid_y = CAPTURE_HEIGHT // 2
+                cv2.line(overlay, (int(self._cx), 0), (int(self._cx), CAPTURE_HEIGHT), (0, 0, 255), 2)
+                if result is not None:
+                    tx = result
+                    cv2.circle(overlay, (int(tx), mid_y), 8, (0, 255, 0), 2)
+                # Small mask thumbnail in corner
+                small = cv2.resize(self._mask_buf, (160, 120))
+                small_bgr = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
+                overlay[0:120, 0:160] = small_bgr
+                _, jpeg = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, STREAM_JPEG_QUALITY])
+                with _stream_overlay_buffer["lock"]:
+                    _stream_overlay_buffer["jpeg"] = jpeg.tobytes()
+
             # Only transmit when a target is detected.
             # Sending stale "last known" position would cause the servo to hold
             # on a phantom location after a target disappears.
@@ -280,6 +307,54 @@ class VisionProcessor:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+class MJPEGStreamHandler(BaseHTTPRequestHandler):
+    """Serves the latest overlay frame as MJPEG (multipart/x-mixed-replace) for browser viewing."""
+
+    def do_GET(self) -> None:
+        if self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK\n")
+            return
+        if self.path != "/" and self.path != "/stream":
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.end_headers()
+        boundary = b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n"
+        interval = 1.0 / STREAM_FPS if STREAM_FPS > 0 else 1.0 / 15
+        buf = _stream_overlay_buffer
+        try:
+            while True:
+                with buf["lock"]:
+                    jpeg = buf["jpeg"]
+                if jpeg is not None:
+                    try:
+                        self.wfile.write(boundary % len(jpeg))
+                        self.wfile.write(jpeg)
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        break
+                time.sleep(interval)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    def log_message(self, format: str, *args) -> None:
+        pass  # suppress per-request logs
+
+
+def _run_stream_server(port: int) -> None:
+    try:
+        server = HTTPServer(("0.0.0.0", port), MJPEGStreamHandler)
+        print(f"[INFO] Overlay stream server listening on 0.0.0.0:{port} (try http://<jetson-ip>:{port}/ or /health)")
+        server.serve_forever()
+    except OSError as e:
+        print(f"[WARN] Overlay stream server failed to start: {e}", file=sys.stderr)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
     cap_queue = queue.Queue(maxsize=CAPTURE_QUEUE_MAXSIZE)
 
@@ -287,11 +362,24 @@ def main() -> None:
     processor = VisionProcessor(cap_queue)
 
     grabber.start()
+
+    stream_server_thread = None
+    if STREAM_OVERLAY:
+        stream_server_thread = threading.Thread(
+            target=_run_stream_server,
+            args=(STREAM_PORT,),
+            daemon=True,
+            name="StreamServer",
+        )
+        stream_server_thread.start()
+
     print(f"[INFO] Vision node started — streaming to {UDP_TARGET_IP}:{UDP_TARGET_PORT}")
     print(f"[INFO] Camera: {CAPTURE_WIDTH}x{CAPTURE_HEIGHT} @ {CAPTURE_FPS}fps MJPEG")
     print(f"[INFO] HSV bounds: lower={tuple(HSV_LOWER)}  upper={tuple(HSV_UPPER)}")
     if DEBUG_SHOW:
         print("[INFO] Debug display enabled (press 'q' to quit)")
+    if STREAM_OVERLAY:
+        print(f"[INFO] Overlay stream: http://<this-machine-ip>:{STREAM_PORT}/ or /stream (open in browser on Mac)")
 
     try:
         processor.run()   # blocks until processor.stop() or KeyboardInterrupt
