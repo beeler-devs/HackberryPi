@@ -454,22 +454,17 @@ int main() {
             VisionPacket pkt;
             if (deserialize_packet(recv_buf, n, pkt)) {
                 ++recv_count;
-                // Staleness check: discard packets older than threshold.
-                // See note in constants section about clock sync requirements.
-                double age = now - pkt.timestamp_s;
                 if (recv_count <= 5 || recv_count % 100 == 0) {
-                    std::printf("[UDP] pkt #%lu: tx=%.1f cx=%.1f age=%.3fs %s\n",
-                                recv_count, pkt.tx, pkt.cx, age,
-                                (age < PACKET_STALE_S && age > -1.0) ? "OK" : "STALE");
+                    std::printf("[UDP] pkt #%lu: tx=%.1f cx=%.1f\n",
+                                recv_count, pkt.tx, pkt.cx);
                     std::fflush(stdout);
                 }
-                if (age < PACKET_STALE_S && age > -1.0) {   // -1.0 allows minor clock skew
-                    last_tx = pkt.cx;
-                    last_cx = pkt.tx;
-                    have_target = true;
-                } else {
-                    ++stale_count;
-                }
+                // Staleness check disabled — Orin and Pi use independent
+                // monotonic clocks that cannot be compared across machines.
+                // Direct Ethernet link has <1ms latency so all packets are fresh.
+                last_tx = pkt.tx;
+                last_cx = pkt.cx;
+                have_target = true;
             }
         }
         // errno == EAGAIN/EWOULDBLOCK is normal (no packet this iteration) — ignore.
