@@ -171,10 +171,10 @@ class VisionProcessor:
             (MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE)
         )
 
-        # UDP socket — non-blocking; sendto drops silently on timeout.
+        # UDP socket — setblocking(False) makes sendto non-blocking without a timeout.
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.bind(("10.0.0.1", 0))  # Force traffic over Ethernet
-        self._sock.settimeout(0.001)   # 1ms timeout; drop rather than stall
+        self._sock.setblocking(False)
         self._dest = (UDP_TARGET_IP, UDP_TARGET_PORT)
 
         # Static crosshair X position for distance computation.
@@ -293,8 +293,9 @@ class VisionProcessor:
                 if self._send_count % 100 == 1:
                     print(f"[UDP] sent pkt #{self._send_count}: tx={tx:.1f} cx={self._cx:.1f} ts={ts:.3f}")
             except OSError as e:
-                print(f"[UDP] send failed: {e}")
-                pass   # timeout or network error — drop and continue
+                self._fail_count = getattr(self, '_fail_count', 0) + 1
+                if self._fail_count <= 3 or self._fail_count % 100 == 0:
+                    print(f"[UDP] send failed (#{self._fail_count}): {e}")
 
             if DEBUG_SHOW:
                 # Draw crosshair and target X positions on the mask for visual calibration.
