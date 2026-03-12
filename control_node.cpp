@@ -140,8 +140,8 @@ static constexpr long LOOP_PERIOD_NS = 1000000L;
 #pragma pack(push, 1)
 struct VisionPacket {
     double timestamp_s;   // bytes  0-7:  time.monotonic() on Jetson (big-endian double)
-    float  cx;            // bytes  8-11: target centroid X (big-endian float)
-    float  tx;            // bytes 12-15: crosshair X (big-endian float, static reference)
+    float  tx;            // bytes  8-11: target centroid X (big-endian float)
+    float  cx;            // bytes 12-15: crosshair X (big-endian float, static reference)
 };
 #pragma pack(pop)
 
