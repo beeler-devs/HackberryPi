@@ -8,7 +8,7 @@ PULSE_NEG45 = 1000
 PULSE_POS45 = 2000
 
 # Step 1: send serial command to switch to PWM mode
-servo = ST3215('/dev/ttyAMA0')  # or /dev/ttyS0
+servo = ST3215('/dev/ttyS0')
 servo.UnLockEprom(SERVO_ID)
 servo.SetMode(SERVO_ID, 2)      # mode 2 = PWM open-loop
 servo.LockEprom(SERVO_ID)
