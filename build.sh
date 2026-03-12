@@ -14,9 +14,10 @@
 set -euo pipefail
 
 # ── Dependency check ──────────────────────────────────────────────────────────
-if ! dpkg -l libpigpio-dev 2>/dev/null | grep -q '^ii'; then
-    echo "ERROR: libpigpio-dev is not installed."
-    echo "       Run: sudo apt install pigpio libpigpio-dev"
+if ! ldconfig -p | grep -q "libpigpio\.so"; then
+    echo "ERROR: libpigpio not found in system library path."
+    echo "       The library may need to be installed manually from:"
+    echo "       https://github.com/joan2937/pigpio"
     exit 1
 fi
 
@@ -31,15 +32,15 @@ fi
 echo "[BUILD] Compiling $SOURCE → $TARGET ..."
 
 g++ \
-    -O3 \               \
-    -std=c++17 \        \
-    -march=native \     \
-    -Wall -Wextra \     \
-    -Wno-unused-result  \
-    -o "$TARGET"        \
-    "$SOURCE"           \
-    -lpigpio            \
-    -lpthread           \
+    -O3 \
+    -std=c++17 \
+    -march=native \
+    -Wall -Wextra \
+    -Wno-unused-result \
+    -o "$TARGET" \
+    "$SOURCE" \
+    -lpigpio \
+    -lpthread \
     -lrt
 
 # Compiler flags explained:
