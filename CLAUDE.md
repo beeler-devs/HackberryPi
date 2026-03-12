@@ -46,7 +46,7 @@ C++: pigpio, pthreads, librt — compiled with `-O3 -march=native -std=c++17`
 ## Key Architecture Decisions
 
 ### Communication Protocol
-Vision node → Control node: 24-byte big-endian UDP packets containing timestamp, target (x,y), and crosshair reference (x,y). Default: `192.168.1.50:5005`.
+Vision node → Control node: 24-byte big-endian UDP packets containing timestamp, target (x,y), and crosshair reference (x,y). Default: `10.0.0.2:5005`.
 
 ### PID State Machine (control_node.cpp)
 Two-state controller based on pixel distance to target:
@@ -63,7 +63,7 @@ Two-state controller based on pixel distance to target:
 |-----------|----------|-------|
 | HSV target bounds | `vision_node.py` | H[85,100], S[120,255], V[120,255] |
 | Crosshair reference | `vision_node.py` | (320, 240) — adjust per monitor |
-| UDP target host | `vision_node.py` | 192.168.1.50:5005 |
+| UDP target host | `vision_node.py` | 10.0.0.2:5005 |
 | Servo GPIO pins | `control_node.cpp` | X=GPIO12, Y=GPIO13, Trigger=GPIO17 |
 | FLICK gains | `control_node.cpp` | Kp=8.0, Kd=4.0 |
 | SETTLE gains | `control_node.cpp` | Kp=5.0, Ki=0.15, Kd=3.0 |

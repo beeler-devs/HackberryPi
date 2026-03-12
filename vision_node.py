@@ -65,7 +65,7 @@ MAX_CONTOUR_AREA  = 40000   # px²; discard accidental large colored regions
 TARGET_STRATEGY   = 'closest'
 
 # ── Network ───────────────────────────────────────────────────────────────────
-UDP_TARGET_IP     = "192.168.1.50"   # Raspberry Pi IP on the direct Ethernet link
+UDP_TARGET_IP     = "10.0.0.2"   # Raspberry Pi IP on the direct Ethernet link
 UDP_TARGET_PORT   = 5005
 
 # ── Threading ─────────────────────────────────────────────────────────────────
@@ -173,6 +173,7 @@ class VisionProcessor:
 
         # UDP socket — non-blocking; sendto drops silently on timeout.
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.bind(("10.0.0.1", 0))  # Force traffic over Ethernet
         self._sock.settimeout(0.001)   # 1ms timeout; drop rather than stall
         self._dest = (UDP_TARGET_IP, UDP_TARGET_PORT)
 
