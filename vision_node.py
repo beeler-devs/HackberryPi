@@ -290,7 +290,7 @@ class VisionProcessor:
             try:
                 self._sock.sendto(packet, self._dest)
                 self._send_count = getattr(self, '_send_count', 0) + 1
-                if self._send_count % 100 == 1:
+                if self._send_count == 1 or self._send_count % 100 == 0:
                     print(f"[UDP] sent pkt #{self._send_count}: tx={tx:.1f} cx={self._cx:.1f} ts={ts:.3f}")
             except OSError as e:
                 self._fail_count = getattr(self, '_fail_count', 0) + 1
