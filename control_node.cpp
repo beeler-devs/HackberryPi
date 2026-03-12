@@ -437,6 +437,8 @@ int main() {
     bool     have_target = false;
 
     double   prev_time = mono_seconds();
+    uint64_t recv_count = 0;
+    uint64_t stale_count = 0;
 
     // ── 1kHz control loop ─────────────────────────────────────────────────────
     while (g_running) {
@@ -451,13 +453,22 @@ int main() {
         if (n == PACKET_SIZE) {
             VisionPacket pkt;
             if (deserialize_packet(recv_buf, n, pkt)) {
+                ++recv_count;
                 // Staleness check: discard packets older than threshold.
                 // See note in constants section about clock sync requirements.
                 double age = now - pkt.timestamp_s;
+                if (recv_count <= 5 || recv_count % 100 == 0) {
+                    std::printf("[UDP] pkt #%lu: tx=%.1f cx=%.1f age=%.3fs %s\n",
+                                recv_count, pkt.tx, pkt.cx, age,
+                                (age < PACKET_STALE_S && age > -1.0) ? "OK" : "STALE");
+                    std::fflush(stdout);
+                }
                 if (age < PACKET_STALE_S && age > -1.0) {   // -1.0 allows minor clock skew
                     last_tx = pkt.cx;
                     last_cx = pkt.tx;
                     have_target = true;
+                } else {
+                    ++stale_count;
                 }
             }
         }

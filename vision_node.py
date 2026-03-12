@@ -289,7 +289,11 @@ class VisionProcessor:
             )
             try:
                 self._sock.sendto(packet, self._dest)
-            except OSError:
+                self._send_count = getattr(self, '_send_count', 0) + 1
+                if self._send_count % 100 == 1:
+                    print(f"[UDP] sent pkt #{self._send_count}: tx={tx:.1f} cx={self._cx:.1f} ts={ts:.3f}")
+            except OSError as e:
+                print(f"[UDP] send failed: {e}")
                 pass   # timeout or network error — drop and continue
 
             if DEBUG_SHOW:
