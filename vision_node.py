@@ -22,6 +22,12 @@ import time
 import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+try:
+    import Jetson.GPIO as GPIO
+    _HAS_GPIO = True
+except ImportError:
+    _HAS_GPIO = False
+
 # ── Camera ───────────────────────────────────────────────────────────────────
 CAMERA_INDEX      = 0        # /dev/video0  (change if camera is on another index)
 CAPTURE_WIDTH     = 640      # pixels; use 1280 for higher accuracy at FPS cost
@@ -75,6 +81,13 @@ UDP_TARGET_PORT   = 5005
 # Increasing this adds latency without throughput benefit.
 CAPTURE_QUEUE_MAXSIZE = 2
 
+# ── Solenoid trigger (Jetson GPIO) ────────────────────────────────────────────
+SOLENOID_ENABLED    = False   # set True to fire solenoid from the Jetson
+SOLENOID_PIN        = 18      # Jetson GPIO pin (BOARD numbering)
+FIRE_THRESHOLD_PX   = 5.0     # fire when |tx - cx| < this (pixels)
+TRIGGER_MIN_MS      = 80      # minimum solenoid dwell time (ms)
+TRIGGER_RANGE_MS    = 20      # random additional dwell (ms)
+
 # ── Debug (disable in production — imshow costs ~5ms per frame) ───────────────
 DEBUG_SHOW = False   # set True to open an OpenCV window showing the HSV mask
 
@@ -87,6 +100,46 @@ STREAM_JPEG_QUALITY = 85  # 1–100; lower = smaller frames, faster
 
 # Shared state for overlay stream: latest JPEG bytes + lock (written by VisionProcessor).
 _stream_overlay_buffer = {"jpeg": None, "lock": threading.Lock()}
+
+# ── Solenoid trigger state ────────────────────────────────────────────────────
+import random as _random
+_solenoid_active = threading.Event()   # set = solenoid currently firing
+
+def _solenoid_init():
+    """Initialize GPIO for solenoid output. Call once at startup."""
+    if not _HAS_GPIO:
+        print("[WARN] Jetson.GPIO not available — solenoid disabled", file=sys.stderr)
+        return False
+    GPIO.setmode(GPIO.BOARD)
+    GPIO.setup(SOLENOID_PIN, GPIO.OUT, initial=GPIO.LOW)
+    return True
+
+def _solenoid_fire():
+    """Fire the solenoid in a detached thread (non-blocking, debounced)."""
+    if _solenoid_active.is_set():
+        return
+    _solenoid_active.set()
+
+    def _pulse():
+        try:
+            GPIO.output(SOLENOID_PIN, GPIO.HIGH)
+            dwell_ms = TRIGGER_MIN_MS + _random.randint(0, TRIGGER_RANGE_MS)
+            time.sleep(dwell_ms / 1000.0)
+            GPIO.output(SOLENOID_PIN, GPIO.LOW)
+            print(f"[DEBUG] Solenoid released (dwell={dwell_ms} ms)")
+        finally:
+            _solenoid_active.clear()
+
+    threading.Thread(target=_pulse, daemon=True, name="SolenoidPulse").start()
+
+def _solenoid_cleanup():
+    """Release GPIO resources."""
+    if _HAS_GPIO:
+        try:
+            GPIO.output(SOLENOID_PIN, GPIO.LOW)
+            GPIO.cleanup(SOLENOID_PIN)
+        except Exception:
+            pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 class FrameGrabber(threading.Thread):
@@ -181,6 +234,11 @@ class VisionProcessor:
 
         # Static crosshair X position for distance computation.
         self._cx = CROSSHAIR_X
+
+        # Solenoid GPIO init (Jetson-side trigger).
+        self._solenoid_ready = False
+        if SOLENOID_ENABLED:
+            self._solenoid_ready = _solenoid_init()
 
     # ── Core vision pipeline ──────────────────────────────────────────────────
     def process_frame(self, frame: np.ndarray):
@@ -313,6 +371,12 @@ class VisionProcessor:
                 if self._fail_count <= 3 or self._fail_count % 100 == 0:
                     print(f"[UDP] send failed (#{self._fail_count}): {e}")
 
+            # ── Solenoid trigger (Jetson-side) ────────────────────────────────
+            if SOLENOID_ENABLED and self._solenoid_ready:
+                pixel_dist = abs(tx - self._cx)
+                if pixel_dist < FIRE_THRESHOLD_PX:
+                    _solenoid_fire()
+
             if DEBUG_SHOW:
                 # Draw crosshair and target X positions on the mask for visual calibration.
                 dbg = cv2.cvtColor(self._mask_buf, cv2.COLOR_GRAY2BGR)
@@ -326,6 +390,8 @@ class VisionProcessor:
     def stop(self) -> None:
         self._running = False
         self._sock.close()
+        if self._solenoid_ready:
+            _solenoid_cleanup()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -62,6 +62,9 @@ static constexpr int     PACKET_SIZE     = 16;
 static constexpr const char* CONFIG_PATH = "config.json";
 
 struct Config {
+    // Solenoid
+    bool solenoid_enabled = false;  // set true to fire solenoid from the Pi
+
     // GPIO
     int pin_trigger = 17;
 
@@ -201,6 +204,7 @@ static bool load_config(const char* path, Config& c) {
         if (it != kv.end()) dst = it->second;
     };
 
+    get_bool ("solenoid_enabled",    c.solenoid_enabled);
     get_int  ("pin_trigger",         c.pin_trigger);
     get_str  ("servo_serial_port",   c.servo_serial_port);
     get_int  ("servo_id",            c.servo_id);
@@ -507,22 +511,22 @@ int main() {
     std::signal(SIGTERM, handle_signal);
 
     // ── pigpio init (for solenoid trigger only) ──────────────────────────────
-    if (gpioInitialise() < 0) {
-        std::fprintf(stderr, "[ERROR] gpioInitialise() failed. Run as root?\n");
-        return 1;
+    if (cfg.solenoid_enabled) {
+        if (gpioInitialise() < 0) {
+            std::fprintf(stderr, "[ERROR] gpioInitialise() failed. Run as root?\n");
+            return 1;
+        }
+        gpioSetMode(cfg.pin_trigger, PI_OUTPUT);
+        gpioWrite(cfg.pin_trigger, 0);
+        std::srand(static_cast<unsigned>(time(nullptr)));
     }
-
-    gpioSetMode(cfg.pin_trigger, PI_OUTPUT);
-    gpioWrite(cfg.pin_trigger, 0);
-
-    std::srand(static_cast<unsigned>(time(nullptr)));
 
     // ── Feetech servo serial port ────────────────────────────────────────────
     int servo_fd = feetech_open(cfg.servo_serial_port.c_str());
     if (servo_fd < 0) {
         std::fprintf(stderr, "[ERROR] Failed to open servo serial port %s\n",
                      cfg.servo_serial_port.c_str());
-        gpioTerminate();
+        if (cfg.solenoid_enabled) gpioTerminate();
         return 1;
     }
 
@@ -539,14 +543,14 @@ int main() {
     if (sock < 0) {
         std::perror("[ERROR] socket()");
         close(servo_fd);
-        gpioTerminate();
+        if (cfg.solenoid_enabled) gpioTerminate();
         return 1;
     }
 
     if (fcntl(sock, F_SETFL, O_NONBLOCK) < 0) {
         std::perror("[ERROR] fcntl(O_NONBLOCK)");
         close(servo_fd);
-        gpioTerminate();
+        if (cfg.solenoid_enabled) gpioTerminate();
         return 1;
     }
 
@@ -558,7 +562,7 @@ int main() {
     if (bind(sock, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) < 0) {
         std::perror("[ERROR] bind()");
         close(servo_fd);
-        gpioTerminate();
+        if (cfg.solenoid_enabled) gpioTerminate();
         return 1;
     }
 
@@ -567,7 +571,8 @@ int main() {
                 servo_id, cfg.servo_serial_port.c_str());
     std::printf("[INFO] Servo position: center=%d range=[%d, %d]\n",
                 cfg.servo_center, cfg.servo_min, cfg.servo_max);
-    std::printf("[INFO] Trigger: GPIO%d\n", cfg.pin_trigger);
+    std::printf("[INFO] Trigger: GPIO%d (%s)\n", cfg.pin_trigger,
+                cfg.solenoid_enabled ? "enabled" : "disabled — solenoid on Jetson");
     std::printf("[INFO] PID Flick  — Kp=%.2f Kd=%.2f\n", cfg.kp_flick, cfg.kd_flick);
     std::printf("[INFO] PID Settle — Kp=%.2f Ki=%.3f Kd=%.2f\n",
                 cfg.kp_settle, cfg.ki_settle, cfg.kd_settle);
@@ -645,7 +650,7 @@ int main() {
 
             feetech_send_position(servo_fd, servo_id, smoothed_pos);
 
-            if (out.fire) {
+            if (cfg.solenoid_enabled && out.fire) {
                 maybe_fire();
             }
         }
@@ -659,13 +664,17 @@ int main() {
     std::printf("\n[INFO] Shutting down...\n");
 
     feetech_send_position(servo_fd, servo_id, cfg.servo_center);
-    gpioWrite(cfg.pin_trigger, 0);
 
-    gpioDelay(100000);
+    if (cfg.solenoid_enabled) {
+        gpioWrite(cfg.pin_trigger, 0);
+        gpioDelay(100000);
+    }
 
     close(servo_fd);
     close(sock);
-    gpioTerminate();
+    if (cfg.solenoid_enabled) {
+        gpioTerminate();
+    }
     std::printf("[INFO] Control node stopped.\n");
     return 0;
 }

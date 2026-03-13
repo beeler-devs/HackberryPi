@@ -1,4 +1,5 @@
 {
+    "solenoid_enabled": true,
     "pin_trigger": 27,
 
     "servo_serial_port": "/dev/ttyS0",

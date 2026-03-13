@@ -83,7 +83,10 @@ Two-state controller based on pixel distance to target:
 | PID→Position scale | `control_node.cpp` | 1.0 (tune up if servo barely moves) |
 | Position smoothing | `control_node.cpp` | 1/4 step per update (first-order) |
 | Torque refresh interval | `control_node.cpp` | Every 512 position writes |
-| Trigger GPIO | `control_node.cpp` | GPIO17 |
+| Solenoid enabled (Pi) | `config.json` / `control_node.cpp` | `false` (solenoid fires from Jetson by default) |
+| Solenoid enabled (Jetson) | `vision_node.py` | `SOLENOID_ENABLED = True` |
+| Solenoid GPIO (Jetson) | `vision_node.py` | BOARD pin 18 |
+| Trigger GPIO (Pi) | `control_node.cpp` | GPIO17 |
 | FLICK gains | `control_node.cpp` | Kp=8.0, Kd=4.0 |
 | SETTLE gains | `control_node.cpp` | Kp=5.0, Ki=0.15, Kd=3.0 |
 | Fire threshold | `control_node.cpp` | <5px distance |
