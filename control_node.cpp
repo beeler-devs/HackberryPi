@@ -813,11 +813,12 @@ int main() {
             intensity = std::min(intensity, 100);  // hard safety cap
 
             // Update wiper if cooldown elapsed
+            // Mutual exclusion: zero inactive channel FIRST, then set active — never both on
             double cooldown_s = cfg.tens_cooldown_ms / 1000.0;
             if ((now - tens.last_update_time) >= cooldown_s) {
+                tens_off(other_ch);
                 tens_set_wiper(tens_spi_handle[target_ch],
                                static_cast<uint8_t>(intensity));
-                tens_off(other_ch);
                 tens.active_channel = target_ch;
                 tens.last_update_time = now;
             }
