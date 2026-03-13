@@ -73,6 +73,7 @@ Two-state controller based on pixel distance to target:
 ### Key Tuning Parameters
 | Parameter | Location | Value |
 |-----------|----------|-------|
+| Target strategy | `vision_node.py` | `'weighted'` (area-weighted centroid across all contours; alternatives: `'closest'`, `'largest'`) |
 | HSV target bounds | `vision_node.py` | H[85,100], S[120,255], V[120,255] |
 | Crosshair reference | `vision_node.py` | (320, 240) — adjust per monitor |
 | UDP target host | `vision_node.py` | 10.0.0.2:5005 |

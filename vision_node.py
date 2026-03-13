@@ -58,11 +58,13 @@ MIN_CONTOUR_AREA  = 50      # px²; discard specular noise below this
 MAX_CONTOUR_AREA  = 40000   # px²; discard accidental large colored regions
 
 # ── Target selection strategy ─────────────────────────────────────────────────
+# 'weighted': area-weighted centroid across ALL valid contours.
+#             Best when target blob fragments — X tracks center of mass.
 # 'closest': pick contour whose centroid is nearest to the crosshair.
 #            Best for Aimlabs (targets always near center; ignores UI chrome).
 # 'largest': pick contour with maximum area.
 #            Faster but may jump to a large off-center blob.
-TARGET_STRATEGY   = 'closest'
+TARGET_STRATEGY   = 'weighted'
 
 # ── Network ───────────────────────────────────────────────────────────────────
 UDP_TARGET_IP     = "10.0.0.2"   # Raspberry Pi IP on the direct Ethernet link
@@ -214,8 +216,20 @@ class VisionProcessor:
         if not valid:
             return None
 
-        # Step 6: Select best contour by configured strategy.
-        if TARGET_STRATEGY == 'closest':
+        # Step 6: Select target X by configured strategy.
+        if TARGET_STRATEGY == 'weighted':
+            # Area-weighted centroid across all valid contours.
+            # A single large blob dominates; small fragments barely shift the result.
+            total_m00 = 0.0
+            total_m10 = 0.0
+            for c in valid:
+                M = cv2.moments(c)
+                total_m00 += M['m00']
+                total_m10 += M['m10']
+            if total_m00 == 0:
+                return None
+            tx = total_m10 / total_m00
+        elif TARGET_STRATEGY == 'closest':
             # Squared distance avoids sqrt — order is preserved for min().
             def sq_dist(c):
                 M = cv2.moments(c)
@@ -224,15 +238,17 @@ class VisionProcessor:
                 px = M['m10'] / M['m00']
                 return (px - self._cx) ** 2
             best = min(valid, key=sq_dist)
+            M = cv2.moments(best)
+            if M['m00'] == 0:
+                return None
+            tx = M['m10'] / M['m00']
         else:
             # 'largest': fastest; fine when only one target is visible at a time.
             best = max(valid, key=cv2.contourArea)
-
-        # Step 7: Compute X centroid via image moments.
-        M = cv2.moments(best)
-        if M['m00'] == 0:
-            return None   # degenerate contour (all pixels on one line)
-        tx = M['m10'] / M['m00']
+            M = cv2.moments(best)
+            if M['m00'] == 0:
+                return None
+            tx = M['m10'] / M['m00']
         return tx
 
     # ── Main processing loop ──────────────────────────────────────────────────
