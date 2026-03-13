@@ -315,7 +315,7 @@ static inline struct timespec mono_ts() {
 }
 
 static void spin_until(const struct timespec& target_ts) {
-    while (true) {
+    while (g_running) {
         struct timespec now = mono_ts();
         if (now.tv_sec > target_ts.tv_sec ||
             (now.tv_sec == target_ts.tv_sec && now.tv_nsec >= target_ts.tv_nsec)) {
@@ -407,15 +407,46 @@ static void feetech_send_position(int fd, uint8_t id, int position) {
 
 static int tens_spi_handle[2] = {-1, -1};
 
-static void tens_set_wiper(int handle, uint8_t value) {
-    if (handle < 0) return;
+static void tens_set_wiper(int handle, uint8_t value, bool verbose = false) {
+    if (handle < 0) {
+        if (verbose) std::printf("[TENS] set_wiper skipped: handle=%d\n", handle);
+        return;
+    }
     value = std::min(value, static_cast<uint8_t>(127));
     char buf[2] = { 0x00, static_cast<char>(value) };
+    int rc = spiWrite(static_cast<unsigned>(handle), buf, 2);
+    if (verbose) {
+        std::printf("[TENS] set_wiper handle=%d value=%d rc=%d\n", handle, value, rc);
+        std::fflush(stdout);
+    }
+}
+
+// MCP4131 TCON register shutdown: writing 0x00 to TCON (address 0x04) clears
+// R0HW, R0A, R0W, R0B — disconnecting all terminals from the resistor network.
+// Command byte: (addr << 4) | (cmd << 2) = (0x04 << 4) | (0x00 << 2) = 0x40
+// This is a harder "off" than wiper=0, which still leaves ~75Ω wiper resistance.
+static void tens_shutdown(int handle, bool verbose = false) {
+    if (handle < 0) return;
+    char buf[2] = { 0x40, 0x00 };
+    int rc = spiWrite(static_cast<unsigned>(handle), buf, 2);
+    if (verbose) {
+        std::printf("[TENS] shutdown (TCON=0x00) handle=%d rc=%d\n", handle, rc);
+        std::fflush(stdout);
+    }
+}
+
+// Re-enable all TCON terminals after a shutdown (TCON = 0xFF)
+static void tens_wakeup(int handle) {
+    if (handle < 0) return;
+    char buf[2] = { 0x40, static_cast<char>(0xFF) };
     spiWrite(static_cast<unsigned>(handle), buf, 2);
 }
 
 static void tens_off(int ch) {
-    if (ch >= 0 && ch < 2) tens_set_wiper(tens_spi_handle[ch], 0);
+    if (ch >= 0 && ch < 2) {
+        tens_set_wiper(tens_spi_handle[ch], 0);
+        tens_shutdown(tens_spi_handle[ch]);
+    }
 }
 
 static void tens_all_off() {
@@ -567,6 +598,8 @@ int main() {
     // ── pigpio init (solenoid GPIO + TENS SPI) ─────────────────────────────
     bool need_pigpio = cfg.solenoid_enabled || cfg.tens_enabled;
     if (need_pigpio) {
+        // Disable pigpio's internal signal handling so our SIGINT handler runs cleanup
+        gpioCfgSetInternals(gpioCfgGetInternals() | PI_CFG_NOSIGHANDLER);
         if (gpioInitialise() < 0) {
             std::fprintf(stderr, "[ERROR] gpioInitialise() failed. Run as root?\n");
             return 1;
@@ -817,10 +850,18 @@ int main() {
             double cooldown_s = cfg.tens_cooldown_ms / 1000.0;
             if ((now - tens.last_update_time) >= cooldown_s) {
                 tens_off(other_ch);
+                tens_wakeup(tens_spi_handle[target_ch]);
                 tens_set_wiper(tens_spi_handle[target_ch],
                                static_cast<uint8_t>(intensity));
                 tens.active_channel = target_ch;
                 tens.last_update_time = now;
+
+                static uint64_t tens_log_count = 0;
+                if (++tens_log_count <= 5 || tens_log_count % 100 == 0) {
+                    std::printf("[TENS] #%lu ch=%d intensity=%d dist=%.1f\n",
+                                tens_log_count, target_ch, intensity, dist);
+                    std::fflush(stdout);
+                }
             }
         }
         // IDLE: nothing to do (servo centered, TENS off from transition)
@@ -831,15 +872,27 @@ int main() {
     }
 
     // ── Cleanup ──────────────────────────────────────────────────────────────
+    // Ignore further signals so a second Ctrl+C doesn't kill us mid-cleanup
+    std::signal(SIGINT,  SIG_IGN);
+    std::signal(SIGTERM, SIG_IGN);
     std::printf("\n[INFO] Shutting down...\n");
 
     feetech_send_position(servo_fd, servo_id, cfg.servo_center);
 
-    // TENS: zero pots and close SPI
+    // TENS: zero + shutdown both pots, then close SPI
     if (cfg.tens_enabled) {
-        tens_all_off();
+        std::printf("[TENS] Shutting down both channels (handles: %d, %d)...\n",
+                    tens_spi_handle[0], tens_spi_handle[1]);
+        std::fflush(stdout);
+        tens_set_wiper(tens_spi_handle[0], 0, true);
+        tens_shutdown(tens_spi_handle[0], true);
+        tens_set_wiper(tens_spi_handle[1], 0, true);
+        tens_shutdown(tens_spi_handle[1], true);
+        gpioDelay(10000);
         if (tens_spi_handle[0] >= 0) spiClose(static_cast<unsigned>(tens_spi_handle[0]));
         if (tens_spi_handle[1] >= 0) spiClose(static_cast<unsigned>(tens_spi_handle[1]));
+        std::printf("[TENS] Both channels shut down and SPI closed\n");
+        std::fflush(stdout);
     }
 
     if (cfg.solenoid_enabled) {

@@ -38,9 +38,9 @@
 
     "loop_period_ns": 1000000,
 
-    "tens_enabled": false,
-    "tens_max_intensity": 80,
-    "tens_min_intensity": 20,
+    "tens_enabled": true,
+    "tens_max_intensity": 63,
+    "tens_min_intensity": 63,
     "tens_activation_px": 150.0,
     "tens_hysteresis_px": 15.0,
     "tens_cooldown_ms": 200,
