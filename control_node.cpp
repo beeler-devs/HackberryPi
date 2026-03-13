@@ -71,9 +71,9 @@ struct Config {
 
     // Servo position
     int servo_center = 2048;
-    int servo_min    = 1024;
-    int servo_max    = 3072;
-    int servo_range  = 1024;
+    int servo_min    = 1365;
+    int servo_max    = 2731;
+    int servo_range  = 683;
 
     // PID → position scaling
     float pid_to_pos_scale = 5.0f;
