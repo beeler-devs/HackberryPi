@@ -53,6 +53,7 @@ static constexpr uint8_t SCS_HEADER     = 0xFF;
 static constexpr uint8_t SCS_INST_WRITE = 0x03;
 static constexpr uint8_t SCS_ADDR_TORQUE = 0x28;
 static constexpr uint8_t SCS_ADDR_GOAL   = 0x2A;
+static constexpr uint8_t SCS_ADDR_SPEED  = 0x2E;
 static constexpr int     PACKET_SIZE     = 16;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -254,6 +255,12 @@ static bool load_config(const char* path, Config& c) {
     c.tens_max_intensity = std::min(c.tens_max_intensity, 100);
     c.tens_min_intensity = std::clamp(c.tens_min_intensity, 0, c.tens_max_intensity);
 
+    // Safety: hard-cap servo rotation to ±60° from center (683 steps on 4096-step/360° servo)
+    static constexpr int MAX_SERVO_RANGE = 683;  // 60° = 60 * (4096/360) ≈ 683
+    c.servo_range = std::min(c.servo_range, MAX_SERVO_RANGE);
+    c.servo_min   = std::max(c.servo_min, c.servo_center - MAX_SERVO_RANGE);
+    c.servo_max   = std::min(c.servo_max, c.servo_center + MAX_SERVO_RANGE);
+
     std::printf("[INFO] Config loaded from %s (%zu keys)\n", path, kv.size());
     return true;
 }
@@ -396,6 +403,22 @@ static void feetech_send_position(int fd, uint8_t id, int position) {
     };
 
     write(fd, pkt, sizeof(pkt));
+}
+
+static void feetech_send_max_speed(int fd, uint8_t id) {
+    // Write 0x0000 to speed register (0x2E) — 0 means no speed limit (maximum)
+    uint8_t spd_l = 0x00;
+    uint8_t spd_h = 0x00;
+    uint8_t len   = 0x05;
+    uint8_t csum  = ~(id + len + SCS_INST_WRITE + SCS_ADDR_SPEED + spd_l + spd_h) & 0xFF;
+
+    uint8_t pkt[9] = {
+        SCS_HEADER, SCS_HEADER,
+        id, len, SCS_INST_WRITE, SCS_ADDR_SPEED, spd_l, spd_h, csum
+    };
+
+    write(fd, pkt, sizeof(pkt));
+    tcdrain(fd);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -642,7 +665,8 @@ int main() {
     uint8_t servo_id = static_cast<uint8_t>(cfg.servo_id);
 
     feetech_send_torque_enable(servo_fd, servo_id);
-    std::printf("[INFO] Servo torque enabled (ID=0x%02X, port=%s)\n",
+    feetech_send_max_speed(servo_fd, servo_id);
+    std::printf("[INFO] Servo torque enabled, speed unlimited (ID=0x%02X, port=%s)\n",
                 servo_id, cfg.servo_serial_port.c_str());
 
     feetech_send_position(servo_fd, servo_id, cfg.servo_center);

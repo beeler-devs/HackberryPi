@@ -72,9 +72,28 @@ MAX_CONTOUR_AREA  = 40000   # px²; discard accidental large colored regions
 #            Faster but may jump to a large off-center blob.
 TARGET_STRATEGY   = 'weighted'
 
+# ── Detection mode ───────────────────────────────────────────────────────
+# 'hsv':  HSV color thresholding (Aimlabs cyan targets, runs on Jetson w/ Arducam)
+# 'yolo': YOLO11n neural network (Valorant enemy detection, runs on laptop w/ GPU)
+DETECTION_MODE    = 'hsv'
+
+# ── Capture source ───────────────────────────────────────────────────────
+# 'camera': Arducam via V4L2 (Jetson Nano)
+# 'screen': Desktop screen capture via mss (laptop running Valorant)
+CAPTURE_SOURCE    = 'camera'
+SCREEN_REGION     = None   # None = full primary monitor, or {'left': x, 'top': y, 'width': w, 'height': h}
+
+# ── YOLO settings (only used when DETECTION_MODE == 'yolo') ──────────────
+YOLO_MODEL_PATH   = 'lib/NeuromuscularAimAssist/training_results/detect/valorant_train/run_a100/weights/best.pt'
+YOLO_CONF_THRESH  = 0.25   # minimum confidence to accept a detection
+YOLO_IOU_THRESH   = 0.45   # NMS IOU threshold
+YOLO_HALF         = True   # FP16 inference (faster on GPU, set False for CPU-only)
+YOLO_IMG_SIZE     = 640    # YOLO internal resize (matches training size)
+
 # ── Network ───────────────────────────────────────────────────────────────────
 UDP_TARGET_IP     = "10.0.0.2"   # Raspberry Pi IP on the direct Ethernet link
 UDP_TARGET_PORT   = 5005
+UDP_SOURCE_IP     = "10.0.0.1"  # Jetson: 10.0.0.1, Laptop: 10.0.0.3 (or "0.0.0.0" to auto-select)
 
 # ── Threading ─────────────────────────────────────────────────────────────────
 # Keep shallow: depth=2 means we hold at most one "in-flight" frame.
@@ -205,9 +224,50 @@ class FrameGrabber(threading.Thread):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+class ScreenGrabber(threading.Thread):
+    """
+    Desktop screen capture thread for laptop-based YOLO mode.
+    Uses mss to grab screenshots and feeds them into the same queue
+    interface as FrameGrabber, so the rest of the pipeline is identical.
+    """
+
+    def __init__(self, cap_queue: queue.Queue) -> None:
+        super().__init__(daemon=True, name="ScreenGrabber")
+        self._queue = cap_queue
+        self._stop_event = threading.Event()
+
+        import mss
+        self._sct = mss.mss()
+        self._region = SCREEN_REGION or self._sct.monitors[1]  # primary monitor
+
+        actual_w = self._region['width']
+        actual_h = self._region['height']
+        print(f"[INFO] Screen capture: {actual_w}x{actual_h} "
+              f"-> resize to {CAPTURE_WIDTH}x{CAPTURE_HEIGHT}")
+
+    def run(self) -> None:
+        sct = self._sct
+        region = self._region
+        q = self._queue
+        while not self._stop_event.is_set():
+            img = sct.grab(region)
+            # mss returns BGRA; drop alpha channel to get BGR for OpenCV
+            frame = np.array(img)[:, :, :3]
+            if frame.shape[1] != CAPTURE_WIDTH or frame.shape[0] != CAPTURE_HEIGHT:
+                frame = cv2.resize(frame, (CAPTURE_WIDTH, CAPTURE_HEIGHT))
+            try:
+                q.put_nowait(frame)
+            except queue.Full:
+                pass
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 class VisionProcessor:
     """
-    Consumes frames from the capture queue, runs HSV color detection,
+    Consumes frames from the capture queue, runs detection (HSV or YOLO),
     and transmits target centroids over UDP.
     """
 
@@ -215,20 +275,25 @@ class VisionProcessor:
         self._queue = cap_queue
         self._running = True
 
-        # Pre-allocate output buffers once. Passing dst= to OpenCV functions
-        # avoids a malloc+memset per call — critical at 100fps.
-        self._hsv_buf  = np.empty((CAPTURE_HEIGHT, CAPTURE_WIDTH, 3), dtype=np.uint8)
-        self._mask_buf = np.empty((CAPTURE_HEIGHT, CAPTURE_WIDTH),    dtype=np.uint8)
+        if DETECTION_MODE == 'yolo':
+            from ultralytics import YOLO
+            self._yolo_model = YOLO(YOLO_MODEL_PATH)
+            print(f"[INFO] YOLO model loaded: {YOLO_MODEL_PATH}")
+        else:
+            # Pre-allocate output buffers once. Passing dst= to OpenCV functions
+            # avoids a malloc+memset per call — critical at 100fps.
+            self._hsv_buf  = np.empty((CAPTURE_HEIGHT, CAPTURE_WIDTH, 3), dtype=np.uint8)
+            self._mask_buf = np.empty((CAPTURE_HEIGHT, CAPTURE_WIDTH),    dtype=np.uint8)
 
-        # Structuring element for morphological ops — built once, reused every frame.
-        self._kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE)
-        )
+            # Structuring element for morphological ops — built once, reused every frame.
+            self._kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE)
+            )
 
         # UDP socket — setblocking(False) makes sendto non-blocking without a timeout.
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.bind(("10.0.0.1", 0))  # Force traffic over Ethernet
+        self._sock.bind((UDP_SOURCE_IP, 0))  # Force traffic over Ethernet
         self._sock.setblocking(False)
         self._dest = (UDP_TARGET_IP, UDP_TARGET_PORT)
 
@@ -242,18 +307,43 @@ class VisionProcessor:
 
     # ── Core vision pipeline ──────────────────────────────────────────────────
     def process_frame(self, frame: np.ndarray):
+        """Dispatch to the active detection backend."""
+        if DETECTION_MODE == 'yolo':
+            return self._process_frame_yolo(frame)
+        return self._process_frame_hsv(frame)
+
+    def _process_frame_yolo(self, frame: np.ndarray):
         """
-        Run the full detection pipeline on a single BGR frame.
+        Run YOLO11n inference on a BGR frame.
+        Returns target_x (center of largest detection) or None.
+        """
+        results = self._yolo_model(
+            frame, conf=YOLO_CONF_THRESH, iou=YOLO_IOU_THRESH,
+            verbose=False, half=YOLO_HALF, imgsz=YOLO_IMG_SIZE
+        )
+        boxes = results[0].boxes
+        if boxes is None or len(boxes) == 0:
+            return None
+
+        xyxy = boxes.xyxy.cpu().numpy()  # (N, 4): x1, y1, x2, y2
+        areas = (xyxy[:, 2] - xyxy[:, 0]) * (xyxy[:, 3] - xyxy[:, 1])
+        best_idx = areas.argmax()
+        x1, _, x2, _ = xyxy[best_idx]
+        return (x1 + x2) / 2.0
+
+    def _process_frame_hsv(self, frame: np.ndarray):
+        """
+        Run HSV color thresholding on a BGR frame.
         Returns target_x in pixels, or None if no target found.
         All operations use pre-allocated buffers to avoid heap allocation.
         """
-        # Step 1: BGR → HSV in-place. dst= reuses self._hsv_buf allocation.
+        # Step 1: BGR -> HSV in-place. dst= reuses self._hsv_buf allocation.
         cv2.cvtColor(frame, cv2.COLOR_BGR2HSV, dst=self._hsv_buf)
 
         # Step 2: Threshold to isolate target color. dst= avoids another allocation.
         cv2.inRange(self._hsv_buf, HSV_LOWER, HSV_UPPER, dst=self._mask_buf)
 
-        # Step 3: Morphological opening (erode→dilate) removes noise specks.
+        # Step 3: Morphological opening (erode->dilate) removes noise specks.
         cv2.erode(self._mask_buf,  self._kernel, dst=self._mask_buf,
                   iterations=MORPH_ERODE_ITER)
         cv2.dilate(self._mask_buf, self._kernel, dst=self._mask_buf,
@@ -276,8 +366,6 @@ class VisionProcessor:
 
         # Step 6: Select target X by configured strategy.
         if TARGET_STRATEGY == 'weighted':
-            # Area-weighted centroid across all valid contours.
-            # A single large blob dominates; small fragments barely shift the result.
             total_m00 = 0.0
             total_m10 = 0.0
             for c in valid:
@@ -288,7 +376,6 @@ class VisionProcessor:
                 return None
             tx = total_m10 / total_m00
         elif TARGET_STRATEGY == 'closest':
-            # Squared distance avoids sqrt — order is preserved for min().
             def sq_dist(c):
                 M = cv2.moments(c)
                 if M['m00'] == 0:
@@ -301,7 +388,6 @@ class VisionProcessor:
                 return None
             tx = M['m10'] / M['m00']
         else:
-            # 'largest': fastest; fine when only one target is visible at a time.
             best = max(valid, key=cv2.contourArea)
             M = cv2.moments(best)
             if M['m00'] == 0:
@@ -332,10 +418,11 @@ class VisionProcessor:
                 if result is not None:
                     tx = result
                     cv2.circle(overlay, (int(tx), mid_y), 8, (0, 255, 0), 2)
-                # Small mask thumbnail in corner
-                small = cv2.resize(self._mask_buf, (160, 120))
-                small_bgr = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
-                overlay[0:120, 0:160] = small_bgr
+                # Small mask thumbnail in corner (HSV mode only)
+                if DETECTION_MODE == 'hsv':
+                    small = cv2.resize(self._mask_buf, (160, 120))
+                    small_bgr = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
+                    overlay[0:120, 0:160] = small_bgr
                 _, jpeg = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, STREAM_JPEG_QUALITY])
                 with _stream_overlay_buffer["lock"]:
                     _stream_overlay_buffer["jpeg"] = jpeg.tobytes()
@@ -344,7 +431,7 @@ class VisionProcessor:
             # Sending stale "last known" position would cause the servo to hold
             # on a phantom location after a target disappears.
             if result is None:
-                if DEBUG_SHOW:
+                if DEBUG_SHOW and DETECTION_MODE == 'hsv':
                     cv2.imshow("mask", self._mask_buf)
                     cv2.waitKey(1)
                 continue
@@ -378,12 +465,14 @@ class VisionProcessor:
                     _solenoid_fire()
 
             if DEBUG_SHOW:
-                # Draw crosshair and target X positions on the mask for visual calibration.
-                dbg = cv2.cvtColor(self._mask_buf, cv2.COLOR_GRAY2BGR)
+                if DETECTION_MODE == 'hsv':
+                    dbg = cv2.cvtColor(self._mask_buf, cv2.COLOR_GRAY2BGR)
+                else:
+                    dbg = frame.copy()
                 mid_y = CAPTURE_HEIGHT // 2
                 cv2.circle(dbg, (int(tx), mid_y), 5, (0, 255, 0), -1)
                 cv2.circle(dbg, (int(self._cx), mid_y), 3, (0, 0, 255), -1)
-                cv2.imshow("mask", dbg)
+                cv2.imshow("debug", dbg)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     self._running = False
 
@@ -446,7 +535,10 @@ def _run_stream_server(port: int) -> None:
 def main() -> None:
     cap_queue = queue.Queue(maxsize=CAPTURE_QUEUE_MAXSIZE)
 
-    grabber   = FrameGrabber(cap_queue)
+    if CAPTURE_SOURCE == 'screen':
+        grabber = ScreenGrabber(cap_queue)
+    else:
+        grabber = FrameGrabber(cap_queue)
     processor = VisionProcessor(cap_queue)
 
     grabber.start()
@@ -462,12 +554,16 @@ def main() -> None:
         stream_server_thread.start()
 
     print(f"[INFO] Vision node started — streaming to {UDP_TARGET_IP}:{UDP_TARGET_PORT}")
-    print(f"[INFO] Camera: {CAPTURE_WIDTH}x{CAPTURE_HEIGHT} @ {CAPTURE_FPS}fps MJPEG")
-    print(f"[INFO] HSV bounds: lower={tuple(HSV_LOWER)}  upper={tuple(HSV_UPPER)}")
+    print(f"[INFO] Detection: {DETECTION_MODE}, capture: {CAPTURE_SOURCE}")
+    if DETECTION_MODE == 'yolo':
+        print(f"[INFO] YOLO model: {YOLO_MODEL_PATH} (conf={YOLO_CONF_THRESH}, iou={YOLO_IOU_THRESH})")
+    else:
+        print(f"[INFO] Camera: {CAPTURE_WIDTH}x{CAPTURE_HEIGHT} @ {CAPTURE_FPS}fps MJPEG")
+        print(f"[INFO] HSV bounds: lower={tuple(HSV_LOWER)}  upper={tuple(HSV_UPPER)}")
     if DEBUG_SHOW:
         print("[INFO] Debug display enabled (press 'q' to quit)")
     if STREAM_OVERLAY:
-        print(f"[INFO] Overlay stream: http://<this-machine-ip>:{STREAM_PORT}/ or /stream (open in browser on Mac)")
+        print(f"[INFO] Overlay stream: http://<this-machine-ip>:{STREAM_PORT}/ or /stream")
 
     try:
         processor.run()   # blocks until processor.stop() or KeyboardInterrupt

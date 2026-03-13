@@ -1,3 +1,6 @@
 [submodule "lib/ShockNRoll"]
 	path = lib/ShockNRoll
 	url = https://github.com/bentonkt/ShockNRoll.git
+[submodule "lib/NeuromuscularAimAssist"]
+	path = lib/NeuromuscularAimAssist
+	url = https://github.com/bentonkt/NeuromuscularAimAssist.git
