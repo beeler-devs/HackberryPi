@@ -1,0 +1,3 @@
+[submodule "lib/ShockNRoll"]
+	path = lib/ShockNRoll
+	url = https://github.com/bentonkt/ShockNRoll.git

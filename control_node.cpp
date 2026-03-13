@@ -115,6 +115,16 @@ struct Config {
 
     // Control loop
     long loop_period_ns = 1000000L;
+
+    // TENS
+    bool  tens_enabled        = false;
+    int   tens_max_intensity  = 80;
+    int   tens_min_intensity  = 20;
+    float tens_activation_px  = 150.0f;
+    float tens_hysteresis_px  = 15.0f;
+    int   tens_cooldown_ms    = 200;
+    int   tens_spi_channel    = 0;
+    int   tens_spi_speed      = 1000000;
 };
 
 // Global config instance — populated once at startup, then read-only.
@@ -231,6 +241,19 @@ static bool load_config(const char* path, Config& c) {
     get_int  ("udp_port",           c.udp_port);
     get_long ("loop_period_ns",     c.loop_period_ns);
 
+    get_bool ("tens_enabled",        c.tens_enabled);
+    get_int  ("tens_max_intensity",  c.tens_max_intensity);
+    get_int  ("tens_min_intensity",  c.tens_min_intensity);
+    get_float("tens_activation_px",  c.tens_activation_px);
+    get_float("tens_hysteresis_px",  c.tens_hysteresis_px);
+    get_int  ("tens_cooldown_ms",    c.tens_cooldown_ms);
+    get_int  ("tens_spi_channel",    c.tens_spi_channel);
+    get_int  ("tens_spi_speed",      c.tens_spi_speed);
+
+    // Safety: hard-cap TENS intensity at 100 regardless of config
+    c.tens_max_intensity = std::min(c.tens_max_intensity, 100);
+    c.tens_min_intensity = std::clamp(c.tens_min_intensity, 0, c.tens_max_intensity);
+
     std::printf("[INFO] Config loaded from %s (%zu keys)\n", path, kv.size());
     return true;
 }
@@ -248,6 +271,7 @@ struct VisionPacket {
 #pragma pack(pop)
 
 enum class ControlState : uint8_t { FLICK, SETTLE };
+enum class SystemState  : uint8_t { SERVO_ACTIVE, TENS_ACTIVE, IDLE };
 
 struct PIDState {
     float integral_x    = 0.0f;
@@ -258,6 +282,11 @@ struct PIDState {
 struct ServoState {
     int   current_pos       = 0;   // initialized from cfg.servo_center in main()
     int   torque_refresh_cnt = 0;
+};
+
+struct TensState {
+    int    active_channel   = -1;   // 0 or 1, -1 = none
+    double last_update_time = 0.0;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -367,6 +396,31 @@ static void feetech_send_position(int fd, uint8_t id, int position) {
     };
 
     write(fd, pkt, sizeof(pkt));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MCP4131 digital potentiometer SPI driver (TENS control)
+//
+// Two MCP4131 chips on SPI0: CE0 (channel 0) and CE1 (channel 1).
+// Write command: 2 bytes — [0x00 (wiper 0, write), value (0-127)]
+// ─────────────────────────────────────────────────────────────────────────────
+
+static int tens_spi_handle[2] = {-1, -1};
+
+static void tens_set_wiper(int handle, uint8_t value) {
+    if (handle < 0) return;
+    value = std::min(value, static_cast<uint8_t>(127));
+    char buf[2] = { 0x00, static_cast<char>(value) };
+    spiWrite(static_cast<unsigned>(handle), buf, 2);
+}
+
+static void tens_off(int ch) {
+    if (ch >= 0 && ch < 2) tens_set_wiper(tens_spi_handle[ch], 0);
+}
+
+static void tens_all_off() {
+    tens_off(0);
+    tens_off(1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -510,15 +564,37 @@ int main() {
     std::signal(SIGINT,  handle_signal);
     std::signal(SIGTERM, handle_signal);
 
-    // ── pigpio init (for solenoid trigger only) ──────────────────────────────
-    if (cfg.solenoid_enabled) {
+    // ── pigpio init (solenoid GPIO + TENS SPI) ─────────────────────────────
+    bool need_pigpio = cfg.solenoid_enabled || cfg.tens_enabled;
+    if (need_pigpio) {
         if (gpioInitialise() < 0) {
             std::fprintf(stderr, "[ERROR] gpioInitialise() failed. Run as root?\n");
             return 1;
         }
+    }
+
+    if (cfg.solenoid_enabled) {
         gpioSetMode(cfg.pin_trigger, PI_OUTPUT);
         gpioWrite(cfg.pin_trigger, 0);
         std::srand(static_cast<unsigned>(time(nullptr)));
+    }
+
+    // ── TENS SPI init ─────────────────────────────────────────────────────────
+    if (cfg.tens_enabled) {
+        tens_spi_handle[0] = spiOpen(0, static_cast<unsigned>(cfg.tens_spi_speed), 0);
+        tens_spi_handle[1] = spiOpen(1, static_cast<unsigned>(cfg.tens_spi_speed), 0);
+        if (tens_spi_handle[0] < 0 || tens_spi_handle[1] < 0) {
+            std::fprintf(stderr, "[WARN] TENS SPI open failed (h0=%d h1=%d), disabling TENS\n",
+                         tens_spi_handle[0], tens_spi_handle[1]);
+            if (tens_spi_handle[0] >= 0) spiClose(static_cast<unsigned>(tens_spi_handle[0]));
+            if (tens_spi_handle[1] >= 0) spiClose(static_cast<unsigned>(tens_spi_handle[1]));
+            tens_spi_handle[0] = tens_spi_handle[1] = -1;
+            cfg.tens_enabled = false;
+        } else {
+            tens_all_off();
+            std::printf("[INFO] TENS SPI initialized (CE0 + CE1, %d Hz)\n",
+                        cfg.tens_spi_speed);
+        }
     }
 
     // ── Feetech servo serial port ────────────────────────────────────────────
@@ -526,7 +602,7 @@ int main() {
     if (servo_fd < 0) {
         std::fprintf(stderr, "[ERROR] Failed to open servo serial port %s\n",
                      cfg.servo_serial_port.c_str());
-        if (cfg.solenoid_enabled) gpioTerminate();
+        if (need_pigpio) gpioTerminate();
         return 1;
     }
 
@@ -543,14 +619,14 @@ int main() {
     if (sock < 0) {
         std::perror("[ERROR] socket()");
         close(servo_fd);
-        if (cfg.solenoid_enabled) gpioTerminate();
+        if (need_pigpio) gpioTerminate();
         return 1;
     }
 
     if (fcntl(sock, F_SETFL, O_NONBLOCK) < 0) {
         std::perror("[ERROR] fcntl(O_NONBLOCK)");
         close(servo_fd);
-        if (cfg.solenoid_enabled) gpioTerminate();
+        if (need_pigpio) gpioTerminate();
         return 1;
     }
 
@@ -562,7 +638,7 @@ int main() {
     if (bind(sock, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) < 0) {
         std::perror("[ERROR] bind()");
         close(servo_fd);
-        if (cfg.solenoid_enabled) gpioTerminate();
+        if (need_pigpio) gpioTerminate();
         return 1;
     }
 
@@ -580,20 +656,31 @@ int main() {
                 cfg.pid_to_pos_scale,
                 cfg.smooth_enabled ? "on" : "off",
                 cfg.smooth_divisor);
+    std::printf("[INFO] TENS: %s", cfg.tens_enabled ? "enabled" : "disabled");
+    if (cfg.tens_enabled) {
+        std::printf(" — intensity=[%d, %d], activation=%.0fpx, cooldown=%dms\n",
+                    cfg.tens_min_intensity, cfg.tens_max_intensity,
+                    cfg.tens_activation_px, cfg.tens_cooldown_ms);
+    } else {
+        std::printf("\n");
+    }
 
     // ── State ────────────────────────────────────────────────────────────────
-    PIDState   pid{};
-    ServoState servo{};
+    PIDState    pid{};
+    ServoState  servo{};
+    TensState   tens{};
     servo.current_pos = cfg.servo_center;
-    uint8_t    recv_buf[PACKET_SIZE];
+    uint8_t     recv_buf[PACKET_SIZE];
 
-    float    last_tx = 0.0f;
-    float    last_cx = 0.0f;
-    bool     have_target = false;
+    float       last_tx = 0.0f;
+    float       last_cx = 0.0f;
+    bool        have_target = false;
 
-    double   prev_time = mono_seconds();
-    uint64_t recv_count = 0;
-    bool     servo_was_active = false;
+    double      prev_time = mono_seconds();
+    double      last_packet_time = prev_time;
+    uint64_t    recv_count = 0;
+    SystemState sys_state = SystemState::IDLE;
+    SystemState prev_sys_state = SystemState::IDLE;
 
     // ── 1kHz control loop ────────────────────────────────────────────────────
     while (g_running) {
@@ -609,6 +696,7 @@ int main() {
             VisionPacket pkt;
             if (deserialize_packet(recv_buf, n, pkt)) {
                 ++recv_count;
+                last_packet_time = now;
                 if (recv_count <= 5 || recv_count % 100 == 0) {
                     std::printf("[UDP] pkt #%lu: tx=%.1f cx=%.1f\n",
                                 recv_count, pkt.tx, pkt.cx);
@@ -620,22 +708,76 @@ int main() {
             }
         }
 
-        // ── Control law ──────────────────────────────────────────────────────
-        if (have_target) {
+        // ── UDP watchdog: force IDLE if no packets for >500ms ────────────────
+        if (have_target && (now - last_packet_time) > 0.5) {
+            have_target = false;
+        }
+
+        // ── Determine system state ──────────────────────────────────────────
+        prev_sys_state = sys_state;
+
+        if (!have_target) {
+            sys_state = SystemState::IDLE;
+        } else {
             float error_x = last_tx - last_cx;
             float dist = std::abs(error_x);
-            bool servo_active = (dist <= cfg.activation_range_px);
 
-            if (servo_active && !servo_was_active) {
-                std::printf("[DEBUG] Servo activated (target in range, dist=%.1f px)\n",
-                            dist);
-                std::fflush(stdout);
-            } else if (!servo_active && servo_was_active) {
-                std::printf("[DEBUG] Servo deactivated (target out of range, dist=%.1f px)\n",
-                            dist);
-                std::fflush(stdout);
+            switch (sys_state) {
+                case SystemState::SERVO_ACTIVE:
+                    if (cfg.tens_enabled &&
+                        dist > cfg.tens_activation_px + cfg.tens_hysteresis_px)
+                        sys_state = SystemState::TENS_ACTIVE;
+                    else if (dist > cfg.activation_range_px)
+                        sys_state = SystemState::IDLE;
+                    break;
+                case SystemState::TENS_ACTIVE:
+                    if (dist < cfg.tens_activation_px - cfg.tens_hysteresis_px)
+                        sys_state = SystemState::SERVO_ACTIVE;
+                    else if (dist > cfg.activation_range_px + cfg.tens_hysteresis_px)
+                        sys_state = SystemState::IDLE;
+                    break;
+                case SystemState::IDLE:
+                    if (dist < cfg.tens_activation_px - cfg.tens_hysteresis_px)
+                        sys_state = SystemState::SERVO_ACTIVE;
+                    else if (cfg.tens_enabled &&
+                             dist <= cfg.activation_range_px - cfg.tens_hysteresis_px)
+                        sys_state = SystemState::TENS_ACTIVE;
+                    else if (!cfg.tens_enabled &&
+                             dist <= cfg.activation_range_px)
+                        sys_state = SystemState::SERVO_ACTIVE;
+                    break;
             }
-            servo_was_active = servo_active;
+        }
+
+        // ── State transition actions ─────────────────────────────────────────
+        if (sys_state != prev_sys_state) {
+            const char* state_names[] = { "SERVO_ACTIVE", "TENS_ACTIVE", "IDLE" };
+            std::printf("[STATE] %s → %s\n",
+                        state_names[static_cast<int>(prev_sys_state)],
+                        state_names[static_cast<int>(sys_state)]);
+            std::fflush(stdout);
+
+            // Leaving TENS_ACTIVE: zero pots immediately
+            if (prev_sys_state == SystemState::TENS_ACTIVE) {
+                tens_all_off();
+                tens.active_channel = -1;
+            }
+
+            // Entering any state: reset PID
+            pid.integral_x   = 0.0f;
+            pid.prev_error_x = last_tx - last_cx;
+
+            // Entering TENS_ACTIVE or IDLE: center servo
+            if (sys_state == SystemState::TENS_ACTIVE ||
+                sys_state == SystemState::IDLE) {
+                feetech_send_position(servo_fd, servo_id, cfg.servo_center);
+                servo.current_pos = cfg.servo_center;
+            }
+        }
+
+        // ── Execute current state ────────────────────────────────────────────
+        if (sys_state == SystemState::SERVO_ACTIVE && have_target) {
+            float error_x = last_tx - last_cx;
 
             ControlOutput out = compute_pid(pid, error_x, dt);
 
@@ -653,7 +795,34 @@ int main() {
             if (cfg.solenoid_enabled && out.fire) {
                 maybe_fire();
             }
+
+        } else if (sys_state == SystemState::TENS_ACTIVE && have_target) {
+            float error_x = last_tx - last_cx;
+            float dist = std::abs(error_x);
+
+            // Channel selection: positive error → ch0, negative → ch1
+            int target_ch = (error_x > 0.0f) ? 0 : 1;
+            int other_ch  = 1 - target_ch;
+
+            // Intensity: linear map from tens_activation_px to activation_range_px
+            float beyond = dist - cfg.tens_activation_px;
+            float max_beyond = cfg.activation_range_px - cfg.tens_activation_px;
+            float frac = std::clamp(beyond / max_beyond, 0.0f, 1.0f);
+            int intensity = cfg.tens_min_intensity +
+                static_cast<int>(frac * (cfg.tens_max_intensity - cfg.tens_min_intensity));
+            intensity = std::min(intensity, 100);  // hard safety cap
+
+            // Update wiper if cooldown elapsed
+            double cooldown_s = cfg.tens_cooldown_ms / 1000.0;
+            if ((now - tens.last_update_time) >= cooldown_s) {
+                tens_set_wiper(tens_spi_handle[target_ch],
+                               static_cast<uint8_t>(intensity));
+                tens_off(other_ch);
+                tens.active_channel = target_ch;
+                tens.last_update_time = now;
+            }
         }
+        // IDLE: nothing to do (servo centered, TENS off from transition)
 
         // ── Busy-spin to maintain loop rate ──────────────────────────────────
         struct timespec wake = ts_add_ns(loop_start, cfg.loop_period_ns);
@@ -665,16 +834,24 @@ int main() {
 
     feetech_send_position(servo_fd, servo_id, cfg.servo_center);
 
+    // TENS: zero pots and close SPI
+    if (cfg.tens_enabled) {
+        tens_all_off();
+        if (tens_spi_handle[0] >= 0) spiClose(static_cast<unsigned>(tens_spi_handle[0]));
+        if (tens_spi_handle[1] >= 0) spiClose(static_cast<unsigned>(tens_spi_handle[1]));
+    }
+
     if (cfg.solenoid_enabled) {
         gpioWrite(cfg.pin_trigger, 0);
+    }
+
+    if (need_pigpio) {
         gpioDelay(100000);
+        gpioTerminate();
     }
 
     close(servo_fd);
     close(sock);
-    if (cfg.solenoid_enabled) {
-        gpioTerminate();
-    }
     std::printf("[INFO] Control node stopped.\n");
     return 0;
 }

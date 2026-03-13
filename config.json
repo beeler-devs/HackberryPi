@@ -36,5 +36,14 @@
 
     "udp_port": 5005,
 
-    "loop_period_ns": 1000000
+    "loop_period_ns": 1000000,
+
+    "tens_enabled": false,
+    "tens_max_intensity": 80,
+    "tens_min_intensity": 20,
+    "tens_activation_px": 150.0,
+    "tens_hysteresis_px": 15.0,
+    "tens_cooldown_ms": 200,
+    "tens_spi_channel": 0,
+    "tens_spi_speed": 1000000
 }
