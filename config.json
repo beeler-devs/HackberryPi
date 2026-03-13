@@ -1,0 +1,39 @@
+{
+    "pin_trigger": 17,
+
+    "servo_serial_port": "/dev/ttyS0",
+    "servo_id": 1,
+
+    "servo_center": 2048,
+    "servo_min": 1024,
+    "servo_max": 3072,
+    "servo_range": 1024,
+
+    "pid_to_pos_scale": 5.0,
+
+    "smooth_enabled": true,
+    "smooth_divisor": 2,
+
+    "torque_refresh_every": 512,
+
+    "kp_flick": 8.0,
+    "kd_flick": 4.0,
+
+    "kp_settle": 5.0,
+    "ki_settle": 0.15,
+    "kd_settle": 3.0,
+
+    "integral_clamp": 200.0,
+
+    "flick_threshold_px": 30.0,
+    "activation_range_px": 1000.0,
+    "fire_threshold_px": 5.0,
+    "target_switch_px": 50.0,
+
+    "trigger_min_ms": 30,
+    "trigger_range_ms": 30,
+
+    "udp_port": 5005,
+
+    "loop_period_ns": 1000000
+}
