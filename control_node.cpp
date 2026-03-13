@@ -75,7 +75,13 @@
  // Start low and tune up — the FPGA's 512/50 ratio is not directly portable to this PID gain set.
  // TUNE: increase if servo barely moves; decrease if it overshoots.
  static constexpr float PID_TO_POS_SCALE = 5.0f;
- 
+
+ // ── Position Smoothing ──────────────────────────────────────────────────────
+ // SMOOTH_ENABLED: true = apply first-order exponential smoothing, false = jump directly to target.
+ // SMOOTH_DIVISOR: moves 1/SMOOTH_DIVISOR of remaining error per update (2 = 50%, 4 = 25%).
+ static constexpr bool SMOOTH_ENABLED = true;
+ static constexpr int  SMOOTH_DIVISOR = 2;
+
  // Number of position writes between torque-enable refreshes.
  // Keeps the servo's torque-enable register active in case of power glitches.
  static constexpr int TORQUE_REFRESH_EVERY = 512;
@@ -392,19 +398,24 @@ static constexpr float ACTIVATION_RANGE_PX = 1000.0f;
  /*
   * smooth_servo_position — first-order exponential smoother.
   *
-  * Moves the current servo position 1/4 of the way toward the target each call.
-  * Ensures at least ±1 step when there's any remaining error (no dead zone).
+  * When SMOOTH_ENABLED: moves 1/SMOOTH_DIVISOR of remaining error per call.
+  * When disabled: jumps directly to target position.
   * Ported from NeuromuscularAimAssist FPGA control_splitter module.
   */
  static int smooth_servo_position(ServoState& ss, int target_pos) {
+     if (!SMOOTH_ENABLED) {
+         ss.current_pos = std::clamp(target_pos, SERVO_MIN, SERVO_MAX);
+         return ss.current_pos;
+     }
+
      int delta = target_pos - ss.current_pos;
-     int step  = delta / 4;   // integer division: move 25% of remaining error
- 
+     int step  = delta / SMOOTH_DIVISOR;
+
      // Avoid getting stuck: if there's error but step rounded to 0, nudge by 1.
      if (step == 0 && delta != 0) {
          step = (delta > 0) ? 1 : -1;
      }
- 
+
      ss.current_pos = std::clamp(ss.current_pos + step, SERVO_MIN, SERVO_MAX);
      return ss.current_pos;
  }
