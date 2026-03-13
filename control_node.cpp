@@ -74,7 +74,7 @@
  //
  // Start low and tune up — the FPGA's 512/50 ratio is not directly portable to this PID gain set.
  // TUNE: increase if servo barely moves; decrease if it overshoots.
- static constexpr float PID_TO_POS_SCALE = 1.0f;
+ static constexpr float PID_TO_POS_SCALE = 5.0f;
  
  // Number of position writes between torque-enable refreshes.
  // Keeps the servo's torque-enable register active in case of power glitches.
@@ -98,7 +98,7 @@
  
  // ── State Machine Thresholds ──────────────────────────────────────────────────
  static constexpr float FLICK_THRESHOLD_PX = 30.0f;
- static constexpr float ACTIVATION_RANGE_PX = 50.0f;
+static constexpr float ACTIVATION_RANGE_PX = 1000.0f;
  static constexpr float FIRE_THRESHOLD_PX  = 5.0f;
  static constexpr float TARGET_SWITCH_PX   = 50.0f;
  
