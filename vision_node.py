@@ -49,8 +49,8 @@ CROSSHAIR_X       = 320.0
 # To calibrate: open a live HSV view (debug mode), sample the target, then tighten
 # these bounds around the observed cluster.
 # Widen H range if targets are missed; narrow S/V range to reject monitor glare.
-HSV_LOWER         = np.array([85,  120, 120], dtype=np.uint8)  # (H_min, S_min, V_min)
-HSV_UPPER         = np.array([100, 255, 255], dtype=np.uint8)  # (H_max, S_max, V_max)
+HSV_LOWER         = np.array([88,  150, 150], dtype=np.uint8)  # (H_min, S_min, V_min)
+HSV_UPPER         = np.array([97,  240, 240], dtype=np.uint8)  # (H_max, S_max, V_max)
 
 # ── Morphological noise reduction ─────────────────────────────────────────────
 # Erode kills isolated noise pixels; dilate restores blob size.
