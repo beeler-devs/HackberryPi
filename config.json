@@ -6,9 +6,9 @@
     "servo_id": 1,
 
     "servo_center": 2048,
-    "servo_min": 1365,
-    "servo_max": 2731,
-    "servo_range": 683,
+    "servo_min": 1764,
+    "servo_max": 2332,
+    "servo_range": 284,
 
     "pid_to_pos_scale": 2.0,
 
@@ -17,31 +17,41 @@
 
     "torque_refresh_every": 512,
 
-    "kp_flick": 4.0,
-    "kd_flick": 6.0,
+    "kp_flick": 3.0,
+    "kd_flick": 0.0,
 
-    "kp_settle": 10.0,
-    "ki_settle": 0.40,
-    "kd_settle": 7.0,
+    "kp_settle": 3.0,
+    "ki_settle": 0.15,
+    "kd_settle": 0.0,
 
-    "integral_clamp": 150.0,
+    "integral_clamp": 15.0,
+    "deriv_filter_alpha": 0.5,
 
     "flick_threshold_px": 60.0,
     "activation_range_px": 1000.0,
-    "fire_threshold_px": 5.0,
+    "fire_threshold_px": 10.0,
     "target_switch_px": 50.0,
+
+    "overshoot_damping_enabled": true,
+    "overshoot_gain_multiplier": 0.5,
+    "overshoot_damping_frames": 10,
+
+    "backlash_enabled": true,
+    "backlash_gain": 1.0,
+    "backlash_ramp_frames": 5,
 
     "trigger_min_ms": 80,
     "trigger_range_ms": 20,
+    "trigger_cooldown_ms": 100,
 
     "udp_port": 5005,
 
     "loop_period_ns": 1000000,
 
     "tens_enabled": true,
-    "tens_max_intensity": 63,
-    "tens_min_intensity": 63,
-    "tens_activation_px": 150.0,
+    "tens_max_intensity": 40,
+    "tens_min_intensity": 20,
+    "tens_activation_px": 200.0,
     "tens_hysteresis_px": 15.0,
     "tens_cooldown_ms": 200,
     "tens_spi_channel": 0,

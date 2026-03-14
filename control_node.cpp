@@ -75,9 +75,9 @@ struct Config {
 
     // Servo position
     int servo_center = 2048;
-    int servo_min    = 1365;
-    int servo_max    = 2731;
-    int servo_range  = 683;
+    int servo_min    = 1536;
+    int servo_max    = 2560;
+    int servo_range  = 512;
 
     // PID → position scaling
     float pid_to_pos_scale = 2.0f;
@@ -101,15 +101,29 @@ struct Config {
     // Integral clamp
     float integral_clamp = 150.0f;
 
+    // Derivative low-pass filter (0.0 = use raw derivative, 1.0 = ignore new samples)
+    float deriv_filter_alpha = 0.85f;
+
     // State machine thresholds
     float flick_threshold_px  = 30.0f;
     float activation_range_px = 1000.0f;
     float fire_threshold_px   = 5.0f;
     float target_switch_px    = 50.0f;
 
+    // Overshoot damping — reduces gains when error crosses zero
+    bool  overshoot_damping_enabled = true;
+    float overshoot_gain_multiplier = 0.5f;   // multiply Kp by this on zero-cross
+    int   overshoot_damping_frames  = 10;     // how many 1ms frames to stay damped
+
+    // Backlash compensation
+    bool  backlash_enabled      = true;
+    float backlash_gain         = 1.0f;   // multiplier on dead zone (1.0 = exact physical model)
+    int   backlash_ramp_frames  = 5;      // ramp in compensation over N frames to prevent step input
+
     // Trigger
     int trigger_min_ms   = 30;
     int trigger_range_ms = 30;
+    int trigger_cooldown_ms = 500;  // minimum time between successive fires
 
     // Network
     int udp_port = 5005;
@@ -233,12 +247,20 @@ static bool load_config(const char* path, Config& c) {
     get_float("ki_settle",          c.ki_settle);
     get_float("kd_settle",          c.kd_settle);
     get_float("integral_clamp",     c.integral_clamp);
+    get_float("deriv_filter_alpha", c.deriv_filter_alpha);
     get_float("flick_threshold_px", c.flick_threshold_px);
     get_float("activation_range_px",c.activation_range_px);
     get_float("fire_threshold_px",  c.fire_threshold_px);
     get_float("target_switch_px",   c.target_switch_px);
+    get_bool ("overshoot_damping_enabled", c.overshoot_damping_enabled);
+    get_float("overshoot_gain_multiplier",c.overshoot_gain_multiplier);
+    get_int  ("overshoot_damping_frames", c.overshoot_damping_frames);
+    get_bool ("backlash_enabled",       c.backlash_enabled);
+    get_float("backlash_gain",          c.backlash_gain);
+    get_int  ("backlash_ramp_frames",   c.backlash_ramp_frames);
     get_int  ("trigger_min_ms",     c.trigger_min_ms);
     get_int  ("trigger_range_ms",   c.trigger_range_ms);
+    get_int  ("trigger_cooldown_ms", c.trigger_cooldown_ms);
     get_int  ("udp_port",           c.udp_port);
     get_long ("loop_period_ns",     c.loop_period_ns);
 
@@ -255,8 +277,8 @@ static bool load_config(const char* path, Config& c) {
     c.tens_max_intensity = std::min(c.tens_max_intensity, 100);
     c.tens_min_intensity = std::clamp(c.tens_min_intensity, 0, c.tens_max_intensity);
 
-    // Safety: hard-cap servo rotation to ±60° from center (683 steps on 4096-step/360° servo)
-    static constexpr int MAX_SERVO_RANGE = 683;  // 60° = 60 * (4096/360) ≈ 683
+    // Safety: hard-cap servo rotation to ±45° from center (512 steps on 4096-step/360° servo)
+    static constexpr int MAX_SERVO_RANGE = 512;  // 45° = 45 * (4096/360) ≈ 512
     c.servo_range = std::min(c.servo_range, MAX_SERVO_RANGE);
     c.servo_min   = std::max(c.servo_min, c.servo_center - MAX_SERVO_RANGE);
     c.servo_max   = std::min(c.servo_max, c.servo_center + MAX_SERVO_RANGE);
@@ -283,7 +305,13 @@ enum class SystemState  : uint8_t { SERVO_ACTIVE, TENS_ACTIVE, IDLE };
 struct PIDState {
     float integral_x    = 0.0f;
     float prev_error_x  = 0.0f;
+    float filtered_deriv = 0.0f;  // low-pass filtered derivative to tame packet spikes
     ControlState state  = ControlState::FLICK;
+    int   damping_countdown = 0;  // frames remaining with reduced gains after overshoot
+    // Backlash tracking
+    int   last_push_sign  = 0;      // +1 = servo pushing right, -1 = left, 0 = neutral
+    float backlash_offset = 0.0f;   // current compensation being applied
+    int   backlash_ramp   = 0;      // frames since last reversal
 };
 
 struct ServoState {
@@ -444,31 +472,12 @@ static void tens_set_wiper(int handle, uint8_t value, bool verbose = false) {
     }
 }
 
-// MCP4131 TCON register shutdown: writing 0x00 to TCON (address 0x04) clears
-// R0HW, R0A, R0W, R0B — disconnecting all terminals from the resistor network.
-// Command byte: (addr << 4) | (cmd << 2) = (0x04 << 4) | (0x00 << 2) = 0x40
-// This is a harder "off" than wiper=0, which still leaves ~75Ω wiper resistance.
-static void tens_shutdown(int handle, bool verbose = false) {
-    if (handle < 0) return;
-    char buf[2] = { 0x40, 0x00 };
-    int rc = spiWrite(static_cast<unsigned>(handle), buf, 2);
-    if (verbose) {
-        std::printf("[TENS] shutdown (TCON=0x00) handle=%d rc=%d\n", handle, rc);
-        std::fflush(stdout);
-    }
-}
-
-// Re-enable all TCON terminals after a shutdown (TCON = 0xFF)
-static void tens_wakeup(int handle) {
-    if (handle < 0) return;
-    char buf[2] = { 0x40, static_cast<char>(0xFF) };
-    spiWrite(static_cast<unsigned>(handle), buf, 2);
-}
-
+// tens_off: just zero the wiper. No TCON manipulation — TCON shutdown/wakeup
+// was added in c4c74b2 to fix "always on" but actually broke TENS entirely
+// by disconnecting terminals and failing to reliably reconnect them.
 static void tens_off(int ch) {
     if (ch >= 0 && ch < 2) {
         tens_set_wiper(tens_spi_handle[ch], 0);
-        tens_shutdown(tens_spi_handle[ch]);
     }
 }
 
@@ -510,67 +519,213 @@ static bool deserialize_packet(const uint8_t* buf, ssize_t len, VisionPacket& ou
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct ControlOutput {
-    int   servo_target_pos;
-    bool  fire;
+    int          servo_target_pos;
+    bool         fire;
+    float        dist;
+    float        servo_offset;
+    ControlState mode;
+    bool         backlash_applied;
+    float        backlash_amount;
+    bool         damped;
 };
 
 static ControlOutput compute_pid(PIDState& pid,
                                   float error_x,
-                                  float dt_s) {
+                                  float dt_s,
+                                  int servo_current_pos,
+                                  bool verbose = false) {
     float dist = std::abs(error_x);
 
-    if (dist > cfg.activation_range_px) {
-        pid.integral_x   = 0.0f;
-        pid.prev_error_x = error_x;
-        return { cfg.servo_center, false };
+    if (verbose) {
+        std::printf("  [PID:input] err=%.2f dist=%.2f prev_err=%.2f dt=%.6fs integral=%.2f damp_cd=%d\n",
+                    error_x, dist, pid.prev_error_x, dt_s, pid.integral_x, pid.damping_countdown);
     }
 
-    float delta_x = std::abs(error_x - pid.prev_error_x);
-    if (delta_x > cfg.target_switch_px) {
+    if (dist > cfg.activation_range_px) {
+        if (verbose) {
+            std::printf("  [PID:skip] dist %.1f > activation_range %.1f → center, reset\n",
+                        dist, cfg.activation_range_px);
+        }
         pid.integral_x   = 0.0f;
         pid.prev_error_x = error_x;
+        pid.last_push_sign = 0;
+        pid.backlash_offset = 0.0f;
+        pid.backlash_ramp = 0;
+        return { cfg.servo_center, false, dist, 0.0f, ControlState::FLICK, false, 0.0f, false };
+    }
+
+    // ── Target switch detection ──
+    float delta_x = std::abs(error_x - pid.prev_error_x);
+    bool target_switched = (delta_x > cfg.target_switch_px);
+    if (target_switched) {
+        if (verbose) {
+            std::printf("  [PID:target_switch] delta=%.1f > threshold=%.1f → reset integral, prev_err, deriv filter\n",
+                        delta_x, cfg.target_switch_px);
+        }
+        pid.integral_x   = 0.0f;
+        pid.prev_error_x = error_x;
+        pid.filtered_deriv = 0.0f;
         pid.state = ControlState::FLICK;
     }
 
+    // ── Overshoot detection: error sign flipped → we overshot ──
+    // Suppress during backlash ramp — the large position change is intentional
+    bool in_backlash_ramp = (pid.backlash_ramp > 0 && pid.backlash_ramp <= cfg.backlash_ramp_frames);
+    bool sign_flipped = (pid.prev_error_x != 0.0f &&
+                         ((error_x > 0.0f) != (pid.prev_error_x > 0.0f)));
+    if (cfg.overshoot_damping_enabled && sign_flipped && !in_backlash_ramp) {
+        if (verbose) {
+            std::printf("  [PID:overshoot] sign flip! err=%.2f prev=%.2f → damping for %d frames, integral zeroed\n",
+                        error_x, pid.prev_error_x, cfg.overshoot_damping_frames);
+        }
+        pid.damping_countdown = cfg.overshoot_damping_frames;
+        pid.integral_x = 0.0f;
+    }
+
+    bool damped = (pid.damping_countdown > 0);
+    if (damped) pid.damping_countdown--;
+    float gain_mult = damped ? cfg.overshoot_gain_multiplier : 1.0f;
+
+    // ── Mode selection ──
+    ControlState prev_state = pid.state;
     if (dist > cfg.flick_threshold_px) {
         pid.state = ControlState::FLICK;
     } else {
         pid.state = ControlState::SETTLE;
     }
+    if (verbose && pid.state != prev_state) {
+        std::printf("  [PID:mode_change] %s → %s (dist=%.1f threshold=%.1f)\n",
+                    prev_state == ControlState::FLICK ? "FLICK" : "SETTLE",
+                    pid.state == ControlState::FLICK ? "FLICK" : "SETTLE",
+                    dist, cfg.flick_threshold_px);
+    }
 
     float output_x;
     float safe_dt = (dt_s > 1e-6f) ? dt_s : 1e-6f;
+    float P_term, I_term = 0.0f, D_term, deriv_x;
+
+    // Compute raw derivative, then low-pass filter to tame packet-arrival spikes
+    float raw_deriv = (error_x - pid.prev_error_x) / safe_dt;
+    float alpha = cfg.deriv_filter_alpha;
+    pid.filtered_deriv = alpha * pid.filtered_deriv + (1.0f - alpha) * raw_deriv;
+    deriv_x = pid.filtered_deriv;
 
     if (pid.state == ControlState::FLICK) {
-        float deriv_x = (error_x - pid.prev_error_x) / safe_dt;
-        output_x = cfg.kp_flick * error_x + cfg.kd_flick * deriv_x;
+        P_term = (cfg.kp_flick * gain_mult) * error_x;
+        D_term = cfg.kd_flick * deriv_x;
+        output_x = P_term + D_term;
+        if (verbose) {
+            std::printf("  [PID:FLICK] Kp=%.2f*%.2f=%.2f Kd=%.2f raw_deriv=%.1f filt_deriv=%.1f | P=%.2f D=%.2f → out=%.2f\n",
+                        cfg.kp_flick, gain_mult, cfg.kp_flick * gain_mult,
+                        cfg.kd_flick, raw_deriv, deriv_x, P_term, D_term, output_x);
+        }
     } else {
-        pid.integral_x = std::clamp(pid.integral_x + error_x * dt_s,
+        float integral_before = pid.integral_x;
+        float integral_add = error_x * dt_s;
+        pid.integral_x = std::clamp(pid.integral_x + integral_add,
                                     -cfg.integral_clamp, cfg.integral_clamp);
-        float deriv_x = (error_x - pid.prev_error_x) / safe_dt;
-        output_x = cfg.kp_settle * error_x
-                 + cfg.ki_settle * pid.integral_x
-                 + cfg.kd_settle * deriv_x;
+        P_term = (cfg.kp_settle * gain_mult) * error_x;
+        I_term = cfg.ki_settle * pid.integral_x;
+        D_term = cfg.kd_settle * deriv_x;
+        output_x = P_term + I_term + D_term;
+        if (verbose) {
+            bool clamped = (std::abs(pid.integral_x) >= cfg.integral_clamp - 0.01f);
+            std::printf("  [PID:SETTLE] Kp=%.2f*%.2f=%.2f Ki=%.3f Kd=%.2f raw_deriv=%.1f filt_deriv=%.1f\n",
+                        cfg.kp_settle, gain_mult, cfg.kp_settle * gain_mult,
+                        cfg.ki_settle, cfg.kd_settle, raw_deriv, deriv_x);
+            std::printf("  [PID:SETTLE]   P=%.2f I=%.2f(integral %.4f+%.4f=%.4f%s) D=%.2f → out=%.2f\n",
+                        P_term, I_term, integral_before, integral_add, pid.integral_x,
+                        clamped ? " CLAMPED" : "", D_term, output_x);
+        }
+    }
+
+    if (verbose && damped) {
+        std::printf("  [PID:damping] gain_mult=%.2f countdown=%d\n", gain_mult, pid.damping_countdown);
     }
 
     pid.prev_error_x = error_x;
 
-    float servo_offset = output_x * cfg.pid_to_pos_scale;
+    float raw_servo_offset = output_x * cfg.pid_to_pos_scale;
+    float servo_offset = raw_servo_offset;
+
+    // Backlash compensation: direction-dependent dead zone model
+    bool backlash_applied = false;
+    float backlash_amount = 0.0f;
+    if (cfg.backlash_enabled) {
+        int current_offset_from_center = servo_current_pos - cfg.servo_center;
+        int desired_sign = (output_x > 0.0f) ? 1 : ((output_x < 0.0f) ? -1 : 0);
+        int current_push_sign = (current_offset_from_center > 0) ? 1 :
+                                ((current_offset_from_center < 0) ? -1 : 0);
+
+        // Reversal: desired direction differs from where servo currently is
+        if (desired_sign != 0 && current_push_sign != 0 && desired_sign != current_push_sign) {
+            if (pid.last_push_sign != desired_sign) {
+                // New reversal detected — start ramp
+                pid.backlash_ramp = 1;
+                pid.last_push_sign = desired_sign;
+            } else {
+                pid.backlash_ramp++;
+            }
+
+            float dead_zone = static_cast<float>(std::abs(current_offset_from_center));
+            float ramp_factor = std::min(static_cast<float>(pid.backlash_ramp) /
+                                         static_cast<float>(cfg.backlash_ramp_frames), 1.0f);
+            backlash_amount = static_cast<float>(desired_sign) * dead_zone * cfg.backlash_gain * ramp_factor;
+            servo_offset += backlash_amount;
+            backlash_applied = true;
+
+            if (verbose) {
+                std::printf("  [PID:backlash] servo_pos=%d center=%d offset_from_center=%d dead_zone=%.0f desired_sign=%d ramp=%d/%d backlash=%.1f\n",
+                            servo_current_pos, cfg.servo_center, current_offset_from_center,
+                            dead_zone, desired_sign, pid.backlash_ramp, cfg.backlash_ramp_frames, backlash_amount);
+            }
+        } else {
+            // No reversal — reset backlash tracking
+            if (desired_sign != 0) pid.last_push_sign = desired_sign;
+            pid.backlash_offset = 0.0f;
+            pid.backlash_ramp = 0;
+        }
+    }
+
+    float pre_clamp_offset = servo_offset;
     servo_offset = std::clamp(servo_offset,
                               static_cast<float>(-cfg.servo_range),
                               static_cast<float>(cfg.servo_range));
-    int target_pos = std::clamp(cfg.servo_center + static_cast<int>(servo_offset),
-                                cfg.servo_min, cfg.servo_max);
+    bool was_clamped = (pre_clamp_offset != servo_offset);
 
-    return { target_pos, dist < cfg.fire_threshold_px };
+    int raw_target_pos = cfg.servo_center + static_cast<int>(servo_offset);
+    int target_pos = std::clamp(raw_target_pos, cfg.servo_min, cfg.servo_max);
+    bool pos_clamped = (raw_target_pos != target_pos);
+
+    if (verbose) {
+        std::printf("  [PID:output] pid_out=%.2f *scale=%.2f → raw_offset=%.2f",
+                    output_x, cfg.pid_to_pos_scale, raw_servo_offset);
+        if (backlash_applied) std::printf(" +backlash=%.1f", backlash_amount);
+        std::printf(" = %.2f", pre_clamp_offset);
+        if (was_clamped) std::printf(" → CLAMPED to %.1f (range=±%d)", servo_offset, cfg.servo_range);
+        std::printf("\n");
+        std::printf("  [PID:pos] center(%d) + offset(%d) = %d",
+                    cfg.servo_center, static_cast<int>(servo_offset), raw_target_pos);
+        if (pos_clamped) std::printf(" → CLAMPED to %d [%d,%d]", target_pos, cfg.servo_min, cfg.servo_max);
+        std::printf(" | fire=%s (dist=%.1f threshold=%.1f)\n",
+                    dist < cfg.fire_threshold_px ? "YES" : "no", dist, cfg.fire_threshold_px);
+    }
+
+    return { target_pos, dist < cfg.fire_threshold_px, dist, servo_offset, pid.state, backlash_applied, backlash_amount, damped };
 }
 
-static int smooth_servo_position(ServoState& ss, int target_pos) {
+static int smooth_servo_position(ServoState& ss, int target_pos, bool verbose = false) {
     if (!cfg.smooth_enabled) {
+        int prev = ss.current_pos;
         ss.current_pos = std::clamp(target_pos, cfg.servo_min, cfg.servo_max);
+        if (verbose) {
+            std::printf("  [SMOOTH:off] target=%d → pos=%d (was %d)\n",
+                        target_pos, ss.current_pos, prev);
+        }
         return ss.current_pos;
     }
 
+    int prev = ss.current_pos;
     int delta = target_pos - ss.current_pos;
     int step  = delta / cfg.smooth_divisor;
 
@@ -579,6 +734,11 @@ static int smooth_servo_position(ServoState& ss, int target_pos) {
     }
 
     ss.current_pos = std::clamp(ss.current_pos + step, cfg.servo_min, cfg.servo_max);
+
+    if (verbose) {
+        std::printf("  [SMOOTH] cur=%d target=%d delta=%d step=%d/%d=%d → new_pos=%d\n",
+                    prev, target_pos, delta, delta, cfg.smooth_divisor, step, ss.current_pos);
+    }
     return ss.current_pos;
 }
 
@@ -587,23 +747,27 @@ static int smooth_servo_position(ServoState& ss, int target_pos) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 static std::atomic<bool> trigger_active{false};
+static std::atomic<uint64_t> last_fire_time_us{0};
 
 static void maybe_fire() {
+    // Enforce cooldown between fires to prevent continuous re-energizing
+    uint64_t now_us = static_cast<uint64_t>(gpioTick());
+    uint64_t cooldown_us = static_cast<uint64_t>(cfg.trigger_cooldown_ms) * 1000;
+    uint64_t last = last_fire_time_us.load(std::memory_order_relaxed);
+    if (now_us - last < cooldown_us && last != 0) return;
+
     if (trigger_active.exchange(true)) return;
 
-    std::printf("[DEBUG] Solenoid firing\n");
-    std::fflush(stdout);
+    last_fire_time_us.store(now_us, std::memory_order_relaxed);
 
     std::thread([]() {
-        gpioWrite(cfg.pin_trigger, 1);
         unsigned dwell_us = static_cast<unsigned>(
             (cfg.trigger_min_ms + (std::rand() % (cfg.trigger_range_ms + 1))) * 1000
         );
+        gpioWrite(cfg.pin_trigger, 1);
         gpioDelay(dwell_us);
         gpioWrite(cfg.pin_trigger, 0);
-        std::printf("[DEBUG] Solenoid released (dwell=%u ms)\n", dwell_us / 1000);
-        std::fflush(stdout);
-        trigger_active.store(false);
+        trigger_active.store(false, std::memory_order_release);
     }).detach();
 }
 
@@ -709,6 +873,13 @@ int main() {
     std::printf("[INFO] PID Flick  — Kp=%.2f Kd=%.2f\n", cfg.kp_flick, cfg.kd_flick);
     std::printf("[INFO] PID Settle — Kp=%.2f Ki=%.3f Kd=%.2f\n",
                 cfg.kp_settle, cfg.ki_settle, cfg.kd_settle);
+    std::printf("[INFO] Derivative filter alpha=%.2f (0=raw, higher=smoother)\n",
+                cfg.deriv_filter_alpha);
+    std::printf("[INFO] Backlash compensation: %s (gain=%.2f ramp_frames=%d)\n",
+                cfg.backlash_enabled ? "on" : "off", cfg.backlash_gain, cfg.backlash_ramp_frames);
+    std::printf("[INFO] Overshoot damping: %s (mult=%.2f frames=%d)\n",
+                cfg.overshoot_damping_enabled ? "on" : "off",
+                cfg.overshoot_gain_multiplier, cfg.overshoot_damping_frames);
     std::printf("[INFO] PID→Pos scale=%.2f  Smoothing=%s (divisor=%d)\n",
                 cfg.pid_to_pos_scale,
                 cfg.smooth_enabled ? "on" : "off",
@@ -749,24 +920,32 @@ int main() {
 
         // ── Receive new packet (non-blocking) ────────────────────────────────
         ssize_t n = recv(sock, recv_buf, sizeof(recv_buf), 0);
+        bool new_packet = false;
         if (n == PACKET_SIZE) {
             VisionPacket pkt;
             if (deserialize_packet(recv_buf, n, pkt)) {
                 ++recv_count;
                 last_packet_time = now;
-                if (recv_count <= 5 || recv_count % 100 == 0) {
-                    std::printf("[UDP] pkt #%lu: tx=%.1f cx=%.1f\n",
-                                recv_count, pkt.tx, pkt.cx);
-                    std::fflush(stdout);
-                }
+                float prev_tx = last_tx, prev_cx = last_cx;
                 last_tx = pkt.tx;
                 last_cx = pkt.cx;
                 have_target = true;
+                new_packet = true;
+                // Log every packet arrival at ~10Hz
+                static uint64_t pkt_log_tick = 0;
+                if (++pkt_log_tick % 100 == 0) {
+                    std::printf("[PKT] #%lu tx=%.1f cx=%.1f err=%.1f (prev_tx=%.1f prev_cx=%.1f delta_err=%.1f) age=%.1fms\n",
+                                recv_count, last_tx, last_cx, last_tx - last_cx,
+                                prev_tx, prev_cx, (last_tx - last_cx) - (prev_tx - prev_cx),
+                                (now - pkt.timestamp_s) * 1000.0);
+                }
             }
         }
 
         // ── UDP watchdog: force IDLE if no packets for >500ms ────────────────
         if (have_target && (now - last_packet_time) > 0.5) {
+            std::printf("[WATCHDOG] No packets for %.0fms → forcing IDLE\n",
+                        (now - last_packet_time) * 1000.0);
             have_target = false;
         }
 
@@ -809,9 +988,15 @@ int main() {
         // ── State transition actions ─────────────────────────────────────────
         if (sys_state != prev_sys_state) {
             const char* state_names[] = { "SERVO_ACTIVE", "TENS_ACTIVE", "IDLE" };
-            std::printf("[STATE] %s → %s\n",
+            float trans_err = last_tx - last_cx;
+            float trans_dist = std::abs(trans_err);
+            std::printf("[STATE] %s → %s (err=%.1f dist=%.1f have_target=%d)\n",
                         state_names[static_cast<int>(prev_sys_state)],
-                        state_names[static_cast<int>(sys_state)]);
+                        state_names[static_cast<int>(sys_state)],
+                        trans_err, trans_dist, have_target ? 1 : 0);
+            std::printf("  [STATE:thresholds] tens_act=%.0f±%.0f servo_act=%.0f flick=%.0f fire=%.0f\n",
+                        cfg.tens_activation_px, cfg.tens_hysteresis_px,
+                        cfg.activation_range_px, cfg.flick_threshold_px, cfg.fire_threshold_px);
             std::fflush(stdout);
 
             // Leaving TENS_ACTIVE: zero pots immediately
@@ -823,6 +1008,10 @@ int main() {
             // Entering any state: reset PID
             pid.integral_x   = 0.0f;
             pid.prev_error_x = last_tx - last_cx;
+            pid.filtered_deriv = 0.0f;
+            pid.last_push_sign = 0;
+            pid.backlash_offset = 0.0f;
+            pid.backlash_ramp = 0;
 
             // Entering TENS_ACTIVE or IDLE: center servo
             if (sys_state == SystemState::TENS_ACTIVE ||
@@ -836,12 +1025,23 @@ int main() {
         if (sys_state == SystemState::SERVO_ACTIVE && have_target) {
             float error_x = last_tx - last_cx;
 
-            ControlOutput out = compute_pid(pid, error_x, dt);
+            // Verbose logging at ~10Hz
+            static uint64_t servo_log_tick = 0;
+            bool verbose = (++servo_log_tick % 100 == 0);
 
-            int smoothed_pos = smooth_servo_position(servo, out.servo_target_pos);
+            if (verbose) {
+                std::printf("──────────────── tick %lu ────────────────\n", servo_log_tick);
+                std::printf("[INPUT] tx=%.1f cx=%.1f → err=%.1f dt=%.6fs new_pkt=%d\n",
+                            last_tx, last_cx, error_x, dt, new_packet ? 1 : 0);
+            }
+
+            ControlOutput out = compute_pid(pid, error_x, dt, servo.current_pos, verbose);
+
+            int smoothed_pos = smooth_servo_position(servo, out.servo_target_pos, verbose);
 
             if (servo.torque_refresh_cnt <= 0) {
                 feetech_send_torque_enable(servo_fd, servo_id);
+                if (verbose) std::printf("  [TORQUE] refreshed\n");
                 servo.torque_refresh_cnt = cfg.torque_refresh_every;
             } else {
                 servo.torque_refresh_cnt--;
@@ -849,7 +1049,21 @@ int main() {
 
             feetech_send_position(servo_fd, servo_id, smoothed_pos);
 
+            if (verbose) {
+                const char* mode = (out.mode == ControlState::FLICK) ? "FLICK" : "SETTLE";
+                char backlash_str[32] = "";
+                if (out.backlash_applied) std::snprintf(backlash_str, sizeof(backlash_str), " +backlash(%.0f)", out.backlash_amount);
+                std::printf("[SUMMARY] %s err=%.1f dist=%.1f offset=%.1f target=%d smoothed=%d%s%s%s\n",
+                            mode, error_x, out.dist, out.servo_offset,
+                            out.servo_target_pos, smoothed_pos,
+                            backlash_str,
+                            out.damped ? " DAMPED" : "",
+                            out.fire ? " FIRE" : "");
+                std::fflush(stdout);
+            }
+
             if (cfg.solenoid_enabled && out.fire) {
+                if (verbose) std::printf("  [TRIGGER] firing solenoid!\n");
                 maybe_fire();
             }
 
@@ -870,22 +1084,27 @@ int main() {
             intensity = std::min(intensity, 100);  // hard safety cap
 
             // Update wiper if cooldown elapsed
-            // Mutual exclusion: zero inactive channel FIRST, then set active — never both on
             double cooldown_s = cfg.tens_cooldown_ms / 1000.0;
             if ((now - tens.last_update_time) >= cooldown_s) {
-                tens_off(other_ch);
-                tens_wakeup(tens_spi_handle[target_ch]);
                 tens_set_wiper(tens_spi_handle[target_ch],
                                static_cast<uint8_t>(intensity));
-                tens.active_channel = target_ch;
-                tens.last_update_time = now;
+                tens_off(other_ch);
 
-                static uint64_t tens_log_count = 0;
-                if (++tens_log_count <= 5 || tens_log_count % 100 == 0) {
-                    std::printf("[TENS] #%lu ch=%d intensity=%d dist=%.1f\n",
-                                tens_log_count, target_ch, intensity, dist);
+                // Log channel changes and periodic intensity updates
+                static uint64_t tens_log_tick = 0;
+                bool tens_verbose = (++tens_log_tick % 100 == 0);
+                if (tens.active_channel != target_ch) {
+                    std::printf("[TENS] ch%d → ch%d err=%.1f dist=%.1f intensity=%d frac=%.2f\n",
+                                tens.active_channel, target_ch, error_x, dist, intensity, frac);
+                    std::fflush(stdout);
+                } else if (tens_verbose) {
+                    std::printf("[TENS] ch%d err=%.1f dist=%.1f intensity=%d frac=%.2f\n",
+                                target_ch, error_x, dist, intensity, frac);
                     std::fflush(stdout);
                 }
+
+                tens.active_channel = target_ch;
+                tens.last_update_time = now;
             }
         }
         // IDLE: nothing to do (servo centered, TENS off from transition)
@@ -903,20 +1122,11 @@ int main() {
 
     feetech_send_position(servo_fd, servo_id, cfg.servo_center);
 
-    // TENS: zero + shutdown both pots, then close SPI
+    // TENS: zero pots and close SPI
     if (cfg.tens_enabled) {
-        std::printf("[TENS] Shutting down both channels (handles: %d, %d)...\n",
-                    tens_spi_handle[0], tens_spi_handle[1]);
-        std::fflush(stdout);
-        tens_set_wiper(tens_spi_handle[0], 0, true);
-        tens_shutdown(tens_spi_handle[0], true);
-        tens_set_wiper(tens_spi_handle[1], 0, true);
-        tens_shutdown(tens_spi_handle[1], true);
-        gpioDelay(10000);
+        tens_all_off();
         if (tens_spi_handle[0] >= 0) spiClose(static_cast<unsigned>(tens_spi_handle[0]));
         if (tens_spi_handle[1] >= 0) spiClose(static_cast<unsigned>(tens_spi_handle[1]));
-        std::printf("[TENS] Both channels shut down and SPI closed\n");
-        std::fflush(stdout);
     }
 
     if (cfg.solenoid_enabled) {

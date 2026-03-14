@@ -45,6 +45,20 @@ C++: pigpio, pthreads, librt — compiled with `-O3 -march=native -std=c++17`
 
 Servo serial: uses POSIX `termios` + `write()` — no additional library needed.
 
+## Change Policy
+
+**Prefer `config.json` over code changes.** If a tuning or behavior change can be made solely via `config.json`, do that instead of editing source files. Only modify `control_node.cpp` or `vision_node.py` when the change requires new logic or structural changes that config alone can't express.
+
+**Log every `config.json` change in [`reasoning.md`](reasoning.md).** Before changing config values:
+1. Read `reasoning.md` to review past changes — check what's already been tried and what worked/didn't.
+2. After making changes, append a dated entry documenting:
+   - **Changed:** Which parameters changed and their old → new values
+   - **Problem:** What wasn't working or what prompted the change
+   - **Reasoning:** Why these specific new values were chosen
+   - **Result:** After testing, note what improved or got worse
+
+This log prevents re-trying failed approaches and builds a history of what tuning actually helps.
+
 ## Key Architecture Decisions
 
 ### Servo Control — Feetech SCS/STS Serial Protocol
@@ -89,4 +103,5 @@ Two-state controller based on pixel distance to target:
 | Trigger GPIO (Pi) | `control_node.cpp` | GPIO17 |
 | FLICK gains | `control_node.cpp` | Kp=8.0, Kd=4.0 |
 | SETTLE gains | `control_node.cpp` | Kp=5.0, Ki=0.15, Kd=3.0 |
+| Backlash compensation | `config.json` | enabled, gain=1.0, ramp_frames=5 |
 | Fire threshold | `control_node.cpp` | <5px distance |
