@@ -469,6 +469,9 @@ class VisionProcessor:
                 if result is not None:
                     tx, blob_w = result
                     cv2.circle(overlay, (int(tx), mid_y), 8, (0, 255, 0), 2)
+                    dist = abs(tx - self._cx)
+                    cv2.putText(overlay, f"blob_w={blob_w:.0f}px  dist={dist:.0f}px", (int(tx) + 12, mid_y - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                 # HSV info text overlay — shows bounds + center sample
                 if DETECTION_MODE == 'hsv':
                     cy_s, cx_s = CAPTURE_HEIGHT // 2, CAPTURE_WIDTH // 2
