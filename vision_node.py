@@ -29,7 +29,7 @@ except ImportError:
     _HAS_GPIO = False
 
 # ── Camera ───────────────────────────────────────────────────────────────────
-CAMERA_INDEX      = 0        # /dev/video0  (change if camera is on another index)
+CAMERA_INDEX      = 1        # /dev/video1  (Arducam OV9782 on this Jetson)
 CAPTURE_WIDTH     = 640      # pixels; use 1280 for higher accuracy at FPS cost
 CAPTURE_HEIGHT    = 480      # pixels; use 720 for higher accuracy at FPS cost
 CAPTURE_FPS       = 100      # OV9782 max; driver must negotiate MJPEG at this rate
