@@ -472,31 +472,12 @@ static void tens_set_wiper(int handle, uint8_t value, bool verbose = false) {
     }
 }
 
-// MCP4131 TCON register shutdown: writing 0x00 to TCON (address 0x04) clears
-// R0HW, R0A, R0W, R0B — disconnecting all terminals from the resistor network.
-// Command byte: (addr << 4) | (cmd << 2) = (0x04 << 4) | (0x00 << 2) = 0x40
-// This is a harder "off" than wiper=0, which still leaves ~75Ω wiper resistance.
-static void tens_shutdown(int handle, bool verbose = false) {
-    if (handle < 0) return;
-    char buf[2] = { 0x40, 0x00 };
-    int rc = spiWrite(static_cast<unsigned>(handle), buf, 2);
-    if (verbose) {
-        std::printf("[TENS] shutdown (TCON=0x00) handle=%d rc=%d\n", handle, rc);
-        std::fflush(stdout);
-    }
-}
-
-// Re-enable all TCON terminals after a shutdown (TCON = 0xFF)
-static void tens_wakeup(int handle) {
-    if (handle < 0) return;
-    char buf[2] = { 0x40, static_cast<char>(0xFF) };
-    spiWrite(static_cast<unsigned>(handle), buf, 2);
-}
-
+// tens_off: just zero the wiper. No TCON manipulation — TCON shutdown/wakeup
+// was added in c4c74b2 to fix "always on" but actually broke TENS entirely
+// by disconnecting terminals and failing to reliably reconnect them.
 static void tens_off(int ch) {
     if (ch >= 0 && ch < 2) {
         tens_set_wiper(tens_spi_handle[ch], 0);
-        tens_shutdown(tens_spi_handle[ch]);
     }
 }
 
@@ -1032,15 +1013,16 @@ int main() {
             pid.backlash_offset = 0.0f;
             pid.backlash_ramp = 0;
 
-            // Entering IDLE: center servo (TENS_ACTIVE keeps servo tracking)
-            if (sys_state == SystemState::IDLE) {
+            // Entering TENS_ACTIVE or IDLE: center servo
+            if (sys_state == SystemState::TENS_ACTIVE ||
+                sys_state == SystemState::IDLE) {
                 feetech_send_position(servo_fd, servo_id, cfg.servo_center);
                 servo.current_pos = cfg.servo_center;
             }
         }
 
         // ── Execute current state ────────────────────────────────────────────
-        if ((sys_state == SystemState::SERVO_ACTIVE || sys_state == SystemState::TENS_ACTIVE) && have_target) {
+        if (sys_state == SystemState::SERVO_ACTIVE && have_target) {
             float error_x = last_tx - last_cx;
 
             // Verbose logging at ~10Hz
@@ -1085,8 +1067,7 @@ int main() {
                 maybe_fire();
             }
 
-        }
-        if (sys_state == SystemState::TENS_ACTIVE && have_target) {
+        } else if (sys_state == SystemState::TENS_ACTIVE && have_target) {
             float error_x = last_tx - last_cx;
             float dist = std::abs(error_x);
 
@@ -1103,13 +1084,25 @@ int main() {
             intensity = std::min(intensity, 100);  // hard safety cap
 
             // Update wiper if cooldown elapsed
-            // Mutual exclusion: zero inactive channel FIRST, then set active — never both on
             double cooldown_s = cfg.tens_cooldown_ms / 1000.0;
             if ((now - tens.last_update_time) >= cooldown_s) {
-                tens_off(other_ch);
-                tens_wakeup(tens_spi_handle[target_ch]);
                 tens_set_wiper(tens_spi_handle[target_ch],
                                static_cast<uint8_t>(intensity));
+                tens_off(other_ch);
+
+                // Log channel changes and periodic intensity updates
+                static uint64_t tens_log_tick = 0;
+                bool tens_verbose = (++tens_log_tick % 100 == 0);
+                if (tens.active_channel != target_ch) {
+                    std::printf("[TENS] ch%d → ch%d err=%.1f dist=%.1f intensity=%d frac=%.2f\n",
+                                tens.active_channel, target_ch, error_x, dist, intensity, frac);
+                    std::fflush(stdout);
+                } else if (tens_verbose) {
+                    std::printf("[TENS] ch%d err=%.1f dist=%.1f intensity=%d frac=%.2f\n",
+                                target_ch, error_x, dist, intensity, frac);
+                    std::fflush(stdout);
+                }
+
                 tens.active_channel = target_ch;
                 tens.last_update_time = now;
             }
@@ -1129,20 +1122,11 @@ int main() {
 
     feetech_send_position(servo_fd, servo_id, cfg.servo_center);
 
-    // TENS: zero + shutdown both pots, then close SPI
+    // TENS: zero pots and close SPI
     if (cfg.tens_enabled) {
-        std::printf("[TENS] Shutting down both channels (handles: %d, %d)...\n",
-                    tens_spi_handle[0], tens_spi_handle[1]);
-        std::fflush(stdout);
-        tens_set_wiper(tens_spi_handle[0], 0, true);
-        tens_shutdown(tens_spi_handle[0], true);
-        tens_set_wiper(tens_spi_handle[1], 0, true);
-        tens_shutdown(tens_spi_handle[1], true);
-        gpioDelay(10000);
+        tens_all_off();
         if (tens_spi_handle[0] >= 0) spiClose(static_cast<unsigned>(tens_spi_handle[0]));
         if (tens_spi_handle[1] >= 0) spiClose(static_cast<unsigned>(tens_spi_handle[1]));
-        std::printf("[TENS] Both channels shut down and SPI closed\n");
-        std::fflush(stdout);
     }
 
     if (cfg.solenoid_enabled) {
