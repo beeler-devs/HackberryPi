@@ -21,15 +21,15 @@
     "kd_flick": 0.0,
 
     "kp_settle": 3.0,
-    "ki_settle": 0.3,
+    "ki_settle": 0.15,
     "kd_settle": 0.0,
 
-    "integral_clamp": 200.0,
+    "integral_clamp": 15.0,
     "deriv_filter_alpha": 0.5,
 
     "flick_threshold_px": 60.0,
     "activation_range_px": 1000.0,
-    "fire_threshold_px": 15.0,
+    "fire_threshold_px": 10.0,
     "target_switch_px": 50.0,
 
     "overshoot_damping_enabled": true,
@@ -48,9 +48,9 @@
 
     "loop_period_ns": 1000000,
 
-    "tens_enabled": false,
-    "tens_max_intensity": 100,
-    "tens_min_intensity": 40,
+    "tens_enabled": true,
+    "tens_max_intensity": 40,
+    "tens_min_intensity": 20,
     "tens_activation_px": 200.0,
     "tens_hysteresis_px": 15.0,
     "tens_cooldown_ms": 200,
