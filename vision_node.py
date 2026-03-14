@@ -29,9 +29,9 @@ except ImportError:
     _HAS_GPIO = False
 
 # ── Camera ───────────────────────────────────────────────────────────────────
-CAMERA_INDEX      = 1        # /dev/video1  (Arducam OV9782 on this Jetson)
-CAPTURE_WIDTH     = 640      # pixels; use 1280 for higher accuracy at FPS cost
-CAPTURE_HEIGHT    = 480      # pixels; use 720 for higher accuracy at FPS cost
+CAMERA_INDEX      = 0        # /dev/video0  (Arducam OV9782 on this Jetson)
+CAPTURE_WIDTH     = 1280     # pixels; higher accuracy at FPS cost
+CAPTURE_HEIGHT    = 720      # pixels; higher accuracy at FPS cost
 CAPTURE_FPS       = 100      # OV9782 max; driver must negotiate MJPEG at this rate
 # V4L2 manual exposure value in device-specific units.
 # 100 ≈ 1ms on most V4L2 drivers (check with v4l2-ctl --list-ctrls on your device).
@@ -42,15 +42,15 @@ EXPOSURE_VALUE    = 800
 # ── Static crosshair ─────────────────────────────────────────────────────────
 # Physical center of your monitor as seen by the camera (in pixels).
 # Measure once by overlaying a crosshair image and noting the pixel coords.
-CROSSHAIR_X       = 320.0
+CROSSHAIR_X       = 640.0
 
 # ── HSV target color bounds ───────────────────────────────────────────────────
 # Aimlabs default target color is cyan/teal. OpenCV HSV: H[0,179] S[0,255] V[0,255].
 # To calibrate: open a live HSV view (debug mode), sample the target, then tighten
 # these bounds around the observed cluster.
 # Widen H range if targets are missed; narrow S/V range to reject monitor glare.
-HSV_LOWER         = np.array([88,  150, 150], dtype=np.uint8)  # (H_min, S_min, V_min)
-HSV_UPPER         = np.array([97,  240, 240], dtype=np.uint8)  # (H_max, S_max, V_max)
+HSV_LOWER         = np.array([86,  140, 140], dtype=np.uint8)  # (H_min, S_min, V_min)
+HSV_UPPER         = np.array([98,  255, 255], dtype=np.uint8)  # (H_max, S_max, V_max)
 
 # ── Morphological noise reduction ─────────────────────────────────────────────
 # Erode kills isolated noise pixels; dilate restores blob size.
@@ -207,10 +207,22 @@ class FrameGrabber(threading.Thread):
     def run(self) -> None:
         cap = self._cap
         q   = self._queue
+        frame_count = 0
+        fail_count = 0
+        t0 = time.monotonic()
         while not self._stop_event.is_set():
             ret, frame = cap.read()   # hardware-timed block; returns at ~10ms intervals
             if not ret:
+                fail_count += 1
+                if fail_count <= 5 or fail_count % 200 == 0:
+                    print(f"[WARN] FrameGrabber: cap.read() returned False (#{fail_count})", file=sys.stderr)
                 continue
+            frame_count += 1
+            if frame_count == 1:
+                print(f"[INFO] FrameGrabber: first frame captured ({frame.shape[1]}x{frame.shape[0]}, dtype={frame.dtype})")
+            elif frame_count == 30:
+                elapsed = time.monotonic() - t0
+                print(f"[INFO] FrameGrabber: {frame_count / elapsed:.1f} fps over first 30 frames")
             try:
                 # put_nowait: raises queue.Full if at capacity.
                 # We discard rather than accumulate to bound latency.
@@ -355,12 +367,14 @@ class VisionProcessor:
             cv2.RETR_EXTERNAL,
             cv2.CHAIN_APPROX_SIMPLE
         )
+        self._last_contours = []  # store for overlay drawing
         if not contours:
             return None
 
         # Step 5: Filter by area to reject noise and large false positives.
         valid = [c for c in contours
                  if MIN_CONTOUR_AREA < cv2.contourArea(c) < MAX_CONTOUR_AREA]
+        self._last_contours = valid
         if not valid:
             return None
 
@@ -395,6 +409,31 @@ class VisionProcessor:
             tx = M['m10'] / M['m00']
         return tx
 
+    # ── Core diagnostics ───────────────────────────────────────────────────────
+    def _log_diagnostics(self, frame: np.ndarray) -> None:
+        """Print periodic stats so the user can tell if detection is working."""
+        now = time.monotonic()
+        if not hasattr(self, '_diag_last'):
+            self._diag_last = now
+            self._diag_frames = 0
+            self._diag_detections = 0
+        self._diag_frames += 1
+
+        elapsed = now - self._diag_last
+        if elapsed >= 3.0:
+            fps = self._diag_frames / elapsed
+            det_rate = self._diag_detections / max(self._diag_frames, 1) * 100
+            # Sample HSV at frame center so user can compare with HSV bounds
+            cy, cx_sample = CAPTURE_HEIGHT // 2, CAPTURE_WIDTH // 2
+            hsv_sample = self._hsv_buf[cy, cx_sample] if DETECTION_MODE == 'hsv' else None
+            hsv_str = f"  center_hsv={tuple(hsv_sample)}" if hsv_sample is not None else ""
+            print(f"[DIAG] {fps:.1f} fps | {self._diag_detections}/{self._diag_frames} detections ({det_rate:.0f}%){hsv_str}")
+            if DETECTION_MODE == 'hsv' and self._diag_detections == 0:
+                print(f"[DIAG] HSV bounds: lower={tuple(HSV_LOWER)} upper={tuple(HSV_UPPER)} — if center_hsv is outside these, adjust bounds")
+            self._diag_last = now
+            self._diag_frames = 0
+            self._diag_detections = 0
+
     # ── Main processing loop ──────────────────────────────────────────────────
     def run(self) -> None:
         """
@@ -409,17 +448,31 @@ class VisionProcessor:
                 continue
 
             result = self.process_frame(frame)
+            self._log_diagnostics(frame)
+            if result is not None:
+                self._diag_detections += 1
 
             # Optional: build overlay and feed MJPEG stream for browser viewing (e.g. on Mac).
             if STREAM_OVERLAY:
                 overlay = frame.copy()
                 mid_y = CAPTURE_HEIGHT // 2
                 cv2.line(overlay, (int(self._cx), 0), (int(self._cx), CAPTURE_HEIGHT), (0, 0, 255), 2)
+                if DETECTION_MODE == 'hsv':
+                    # Draw all valid contours in yellow so user can see what HSV is picking up
+                    if hasattr(self, '_last_contours') and self._last_contours:
+                        cv2.drawContours(overlay, self._last_contours, -1, (0, 255, 255), 2)
                 if result is not None:
                     tx = result
                     cv2.circle(overlay, (int(tx), mid_y), 8, (0, 255, 0), 2)
-                # Small mask thumbnail in corner (HSV mode only)
+                # HSV info text overlay — shows bounds + center sample
                 if DETECTION_MODE == 'hsv':
+                    cy_s, cx_s = CAPTURE_HEIGHT // 2, CAPTURE_WIDTH // 2
+                    hsv_center = self._hsv_buf[cy_s, cx_s]
+                    cv2.putText(overlay, f"HSV@center: {tuple(hsv_center)}", (170, 15),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(overlay, f"Bounds: {tuple(HSV_LOWER)}-{tuple(HSV_UPPER)}", (170, 35),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    # Small mask thumbnail in corner
                     small = cv2.resize(self._mask_buf, (160, 120))
                     small_bgr = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
                     overlay[0:120, 0:160] = small_bgr
