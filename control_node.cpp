@@ -80,26 +80,26 @@ struct Config {
     int servo_range  = 683;
 
     // PID → position scaling
-    float pid_to_pos_scale = 5.0f;
+    float pid_to_pos_scale = 2.0f;
 
     // Position smoothing
     bool smooth_enabled = true;
-    int  smooth_divisor = 2;
+    int  smooth_divisor = 4;
 
     // Torque refresh
     int torque_refresh_every = 512;
 
     // PID — FLICK state
-    float kp_flick = 8.0f;
-    float kd_flick = 4.0f;
+    float kp_flick = 4.0f;
+    float kd_flick = 6.0f;
 
     // PID — SETTLE state
-    float kp_settle = 5.0f;
-    float ki_settle = 0.15f;
-    float kd_settle = 3.0f;
+    float kp_settle = 2.5f;
+    float ki_settle = 0.10f;
+    float kd_settle = 4.0f;
 
     // Integral clamp
-    float integral_clamp = 200.0f;
+    float integral_clamp = 150.0f;
 
     // State machine thresholds
     float flick_threshold_px  = 30.0f;
