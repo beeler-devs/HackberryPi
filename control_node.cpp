@@ -54,7 +54,7 @@ static constexpr uint8_t SCS_INST_WRITE = 0x03;
 static constexpr uint8_t SCS_ADDR_TORQUE = 0x28;
 static constexpr uint8_t SCS_ADDR_GOAL   = 0x2A;
 static constexpr uint8_t SCS_ADDR_SPEED  = 0x2E;
-static constexpr int     PACKET_SIZE     = 16;
+static constexpr int     PACKET_SIZE     = 20;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration — loaded from config.json at startup
@@ -109,6 +109,12 @@ struct Config {
     float activation_range_px = 1000.0f;
     float fire_threshold_px   = 5.0f;
     float target_switch_px    = 50.0f;
+
+    // Dynamic blob-width scaling
+    float fire_threshold_width_scale  = 0.15f;   // fire_thresh = base + blob_w * scale
+    float flick_threshold_width_scale = 0.1f;    // flick_thresh = base + blob_w * scale
+    float settle_gain_reference_width = 60.0f;   // blob_w at which settle gains = 100%
+    float settle_gain_min_scale       = 0.3f;    // floor for gain scaling (30%)
 
     // Overshoot damping — reduces gains when error crosses zero
     bool  overshoot_damping_enabled = true;
@@ -252,6 +258,10 @@ static bool load_config(const char* path, Config& c) {
     get_float("activation_range_px",c.activation_range_px);
     get_float("fire_threshold_px",  c.fire_threshold_px);
     get_float("target_switch_px",   c.target_switch_px);
+    get_float("fire_threshold_width_scale",  c.fire_threshold_width_scale);
+    get_float("flick_threshold_width_scale", c.flick_threshold_width_scale);
+    get_float("settle_gain_reference_width", c.settle_gain_reference_width);
+    get_float("settle_gain_min_scale",       c.settle_gain_min_scale);
     get_bool ("overshoot_damping_enabled", c.overshoot_damping_enabled);
     get_float("overshoot_gain_multiplier",c.overshoot_gain_multiplier);
     get_int  ("overshoot_damping_frames", c.overshoot_damping_frames);
@@ -296,6 +306,7 @@ struct VisionPacket {
     double timestamp_s;
     float  tx;
     float  cx;
+    float  blob_w;
 };
 #pragma pack(pop)
 
@@ -509,8 +520,9 @@ static bool deserialize_packet(const uint8_t* buf, ssize_t len, VisionPacket& ou
         return f;
     };
 
-    out.tx = read_f32(buf +  8);
-    out.cx = read_f32(buf + 12);
+    out.tx     = read_f32(buf +  8);
+    out.cx     = read_f32(buf + 12);
+    out.blob_w = read_f32(buf + 16);
     return true;
 }
 
@@ -533,6 +545,9 @@ static ControlOutput compute_pid(PIDState& pid,
                                   float error_x,
                                   float dt_s,
                                   int servo_current_pos,
+                                  float eff_fire_threshold,
+                                  float eff_flick_threshold,
+                                  float settle_gain_scale,
                                   bool verbose = false) {
     float dist = std::abs(error_x);
 
@@ -588,7 +603,7 @@ static ControlOutput compute_pid(PIDState& pid,
 
     // ── Mode selection ──
     ControlState prev_state = pid.state;
-    if (dist > cfg.flick_threshold_px) {
+    if (dist > eff_flick_threshold) {
         pid.state = ControlState::FLICK;
     } else {
         pid.state = ControlState::SETTLE;
@@ -597,7 +612,7 @@ static ControlOutput compute_pid(PIDState& pid,
         std::printf("  [PID:mode_change] %s → %s (dist=%.1f threshold=%.1f)\n",
                     prev_state == ControlState::FLICK ? "FLICK" : "SETTLE",
                     pid.state == ControlState::FLICK ? "FLICK" : "SETTLE",
-                    dist, cfg.flick_threshold_px);
+                    dist, eff_flick_threshold);
     }
 
     float output_x;
@@ -624,9 +639,9 @@ static ControlOutput compute_pid(PIDState& pid,
         float integral_add = error_x * dt_s;
         pid.integral_x = std::clamp(pid.integral_x + integral_add,
                                     -cfg.integral_clamp, cfg.integral_clamp);
-        P_term = (cfg.kp_settle * gain_mult) * error_x;
+        P_term = (cfg.kp_settle * gain_mult * settle_gain_scale) * error_x;
         I_term = cfg.ki_settle * pid.integral_x;
-        D_term = cfg.kd_settle * deriv_x;
+        D_term = (cfg.kd_settle * settle_gain_scale) * deriv_x;
         output_x = P_term + I_term + D_term;
         if (verbose) {
             bool clamped = (std::abs(pid.integral_x) >= cfg.integral_clamp - 0.01f);
@@ -708,10 +723,10 @@ static ControlOutput compute_pid(PIDState& pid,
                     cfg.servo_center, static_cast<int>(servo_offset), raw_target_pos);
         if (pos_clamped) std::printf(" → CLAMPED to %d [%d,%d]", target_pos, cfg.servo_min, cfg.servo_max);
         std::printf(" | fire=%s (dist=%.1f threshold=%.1f)\n",
-                    dist < cfg.fire_threshold_px ? "YES" : "no", dist, cfg.fire_threshold_px);
+                    dist < eff_fire_threshold ? "YES" : "no", dist, eff_fire_threshold);
     }
 
-    return { target_pos, dist < cfg.fire_threshold_px, dist, servo_offset, pid.state, backlash_applied, backlash_amount, damped };
+    return { target_pos, dist < eff_fire_threshold, dist, servo_offset, pid.state, backlash_applied, backlash_amount, damped };
 }
 
 static int smooth_servo_position(ServoState& ss, int target_pos, bool verbose = false) {
@@ -902,6 +917,7 @@ int main() {
 
     float       last_tx = 0.0f;
     float       last_cx = 0.0f;
+    float       last_blob_w = 0.0f;
     bool        have_target = false;
 
     double      prev_time = mono_seconds();
@@ -929,13 +945,14 @@ int main() {
                 float prev_tx = last_tx, prev_cx = last_cx;
                 last_tx = pkt.tx;
                 last_cx = pkt.cx;
+                last_blob_w = pkt.blob_w;
                 have_target = true;
                 new_packet = true;
                 // Log every packet arrival at ~10Hz
                 static uint64_t pkt_log_tick = 0;
                 if (++pkt_log_tick % 100 == 0) {
-                    std::printf("[PKT] #%lu tx=%.1f cx=%.1f err=%.1f (prev_tx=%.1f prev_cx=%.1f delta_err=%.1f) age=%.1fms\n",
-                                recv_count, last_tx, last_cx, last_tx - last_cx,
+                    std::printf("[PKT] #%lu tx=%.1f cx=%.1f blob_w=%.1f err=%.1f (prev_tx=%.1f prev_cx=%.1f delta_err=%.1f) age=%.1fms\n",
+                                recv_count, last_tx, last_cx, last_blob_w, last_tx - last_cx,
                                 prev_tx, prev_cx, (last_tx - last_cx) - (prev_tx - prev_cx),
                                 (now - pkt.timestamp_s) * 1000.0);
                 }
@@ -994,9 +1011,12 @@ int main() {
                         state_names[static_cast<int>(prev_sys_state)],
                         state_names[static_cast<int>(sys_state)],
                         trans_err, trans_dist, have_target ? 1 : 0);
-            std::printf("  [STATE:thresholds] tens_act=%.0f±%.0f servo_act=%.0f flick=%.0f fire=%.0f\n",
+            float eff_fire_t = cfg.fire_threshold_px + last_blob_w * cfg.fire_threshold_width_scale;
+            float eff_flick_t = cfg.flick_threshold_px + last_blob_w * cfg.flick_threshold_width_scale;
+            std::printf("  [STATE:thresholds] tens_act=%.0f±%.0f servo_act=%.0f flick=%.0f(eff=%.0f) fire=%.0f(eff=%.0f) blob_w=%.1f\n",
                         cfg.tens_activation_px, cfg.tens_hysteresis_px,
-                        cfg.activation_range_px, cfg.flick_threshold_px, cfg.fire_threshold_px);
+                        cfg.activation_range_px, cfg.flick_threshold_px, eff_flick_t,
+                        cfg.fire_threshold_px, eff_fire_t, last_blob_w);
             std::fflush(stdout);
 
             // Leaving TENS_ACTIVE: zero pots immediately
@@ -1029,13 +1049,23 @@ int main() {
             static uint64_t servo_log_tick = 0;
             bool verbose = (++servo_log_tick % 100 == 0);
 
+            // Compute dynamic thresholds/gains based on blob width
+            float eff_fire_threshold = cfg.fire_threshold_px + last_blob_w * cfg.fire_threshold_width_scale;
+            float eff_flick_threshold = cfg.flick_threshold_px + last_blob_w * cfg.flick_threshold_width_scale;
+            float settle_gain_scale = (cfg.settle_gain_reference_width > 0.0f)
+                ? std::clamp(last_blob_w / cfg.settle_gain_reference_width, cfg.settle_gain_min_scale, 1.0f)
+                : 1.0f;
+
             if (verbose) {
                 std::printf("──────────────── tick %lu ────────────────\n", servo_log_tick);
-                std::printf("[INPUT] tx=%.1f cx=%.1f → err=%.1f dt=%.6fs new_pkt=%d\n",
-                            last_tx, last_cx, error_x, dt, new_packet ? 1 : 0);
+                std::printf("[INPUT] tx=%.1f cx=%.1f blob_w=%.1f → err=%.1f dt=%.6fs new_pkt=%d\n",
+                            last_tx, last_cx, last_blob_w, error_x, dt, new_packet ? 1 : 0);
+                std::printf("[DYNAMIC] eff_fire=%.1f eff_flick=%.1f settle_gain_scale=%.2f\n",
+                            eff_fire_threshold, eff_flick_threshold, settle_gain_scale);
             }
 
-            ControlOutput out = compute_pid(pid, error_x, dt, servo.current_pos, verbose);
+            ControlOutput out = compute_pid(pid, error_x, dt, servo.current_pos,
+                                            eff_fire_threshold, eff_flick_threshold, settle_gain_scale, verbose);
 
             int smoothed_pos = smooth_servo_position(servo, out.servo_target_pos, verbose);
 

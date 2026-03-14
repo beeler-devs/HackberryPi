@@ -32,6 +32,11 @@
     "fire_threshold_px": 10.0,
     "target_switch_px": 50.0,
 
+    "fire_threshold_width_scale": 0.15,
+    "flick_threshold_width_scale": 0.1,
+    "settle_gain_reference_width": 60.0,
+    "settle_gain_min_scale": 0.3,
+
     "overshoot_damping_enabled": true,
     "overshoot_gain_multiplier": 0.5,
     "overshoot_damping_frames": 10,

@@ -382,13 +382,16 @@ class VisionProcessor:
         if TARGET_STRATEGY == 'weighted':
             total_m00 = 0.0
             total_m10 = 0.0
+            total_weighted_width = 0.0
             for c in valid:
                 M = cv2.moments(c)
                 total_m00 += M['m00']
                 total_m10 += M['m10']
+                total_weighted_width += M['m00'] * cv2.boundingRect(c)[2]
             if total_m00 == 0:
                 return None
             tx = total_m10 / total_m00
+            blob_w = total_weighted_width / total_m00
         elif TARGET_STRATEGY == 'closest':
             def sq_dist(c):
                 M = cv2.moments(c)
@@ -401,13 +404,15 @@ class VisionProcessor:
             if M['m00'] == 0:
                 return None
             tx = M['m10'] / M['m00']
+            blob_w = float(cv2.boundingRect(best)[2])
         else:
             best = max(valid, key=cv2.contourArea)
             M = cv2.moments(best)
             if M['m00'] == 0:
                 return None
             tx = M['m10'] / M['m00']
-        return tx
+            blob_w = float(cv2.boundingRect(best)[2])
+        return (tx, blob_w)
 
     # ── Core diagnostics ───────────────────────────────────────────────────────
     def _log_diagnostics(self, frame: np.ndarray) -> None:
@@ -462,7 +467,7 @@ class VisionProcessor:
                     if hasattr(self, '_last_contours') and self._last_contours:
                         cv2.drawContours(overlay, self._last_contours, -1, (0, 255, 255), 2)
                 if result is not None:
-                    tx = result
+                    tx, blob_w = result
                     cv2.circle(overlay, (int(tx), mid_y), 8, (0, 255, 0), 2)
                 # HSV info text overlay — shows bounds + center sample
                 if DETECTION_MODE == 'hsv':
@@ -489,23 +494,24 @@ class VisionProcessor:
                     cv2.waitKey(1)
                 continue
 
-            tx = result
+            tx, blob_w = result
             ts = time.monotonic()   # seconds; used by Pi for staleness check
 
-            # Pack as big-endian binary: 8+4+4 = 16 bytes total.
-            # Format: double timestamp | float tx | float cx
-            # (cx = crosshair static X center; tx = target centroid X)
+            # Pack as big-endian binary: 8+4+4+4 = 20 bytes total.
+            # Format: double timestamp | float tx | float cx | float blob_w
+            # (cx = crosshair static X center; tx = target centroid X; blob_w = blob width)
             packet = struct.pack(
-                '!dff',
+                '!dfff',
                 ts,
                 tx,           # target centroid X
-                self._cx      # crosshair reference X (static)
+                self._cx,     # crosshair reference X (static)
+                blob_w        # blob bounding-rect width (pixels)
             )
             try:
                 self._sock.sendto(packet, self._dest)
                 self._send_count = getattr(self, '_send_count', 0) + 1
                 if self._send_count == 1 or self._send_count % 100 == 0:
-                    print(f"[UDP] sent pkt #{self._send_count}: tx={tx:.1f} cx={self._cx:.1f} ts={ts:.3f}")
+                    print(f"[UDP] sent pkt #{self._send_count}: tx={tx:.1f} cx={self._cx:.1f} blob_w={blob_w:.1f} ts={ts:.3f}")
             except OSError as e:
                 self._fail_count = getattr(self, '_fail_count', 0) + 1
                 if self._fail_count <= 3 or self._fail_count % 100 == 0:

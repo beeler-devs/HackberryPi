@@ -121,3 +121,25 @@ The root cause is the 1kHz loop vs ~10Hz vision packets: error is constant for ~
 **Result:** _(Fill in after testing)_
 
 ---
+
+## 2026-03-14 — Add blob width to UDP packet + dynamic fire/flick thresholds and settle gain scaling
+
+**Changed:**
+- `fire_threshold_width_scale`: new, default 0.15
+- `flick_threshold_width_scale`: new, default 0.1
+- `settle_gain_reference_width`: new, default 60.0
+- `settle_gain_min_scale`: new, default 0.3
+
+**Problem:** Fire threshold and settle gains were static. When the target blob is small (far away), the same pixel-error threshold is too generous and the same settle gains are too aggressive, causing premature firing and oscillation on distant targets.
+
+**Reasoning:** Vision node now computes blob bounding-rect width and sends it as a 4th float in the UDP packet (20 bytes total, was 16). Control node uses blob_w to:
+- Scale fire threshold: `eff_fire = base + blob_w * 0.15` (tighter for small blobs)
+- Scale flick threshold: `eff_flick = base + blob_w * 0.1`
+- Scale settle P and D gains: `scale = clamp(blob_w / 60.0, 0.3, 1.0)` (softer for small/distant blobs, full strength when blob >= 60px)
+- Ki is NOT scaled (integral self-regulates via clamp)
+
+Example: blob_w=10px (far) → fire=11.5, settle gains at 30% floor. blob_w=60px (close) → fire=19, settle gains at 100%.
+
+**Result:** _(Fill in after testing)_
+
+---
