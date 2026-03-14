@@ -75,9 +75,9 @@ struct Config {
 
     // Servo position
     int servo_center = 2048;
-    int servo_min    = 1365;
-    int servo_max    = 2731;
-    int servo_range  = 683;
+    int servo_min    = 1536;
+    int servo_max    = 2560;
+    int servo_range  = 512;
 
     // PID → position scaling
     float pid_to_pos_scale = 2.0f;
@@ -257,8 +257,8 @@ static bool load_config(const char* path, Config& c) {
     c.tens_max_intensity = std::min(c.tens_max_intensity, 100);
     c.tens_min_intensity = std::clamp(c.tens_min_intensity, 0, c.tens_max_intensity);
 
-    // Safety: hard-cap servo rotation to ±60° from center (683 steps on 4096-step/360° servo)
-    static constexpr int MAX_SERVO_RANGE = 683;  // 60° = 60 * (4096/360) ≈ 683
+    // Safety: hard-cap servo rotation to ±45° from center (512 steps on 4096-step/360° servo)
+    static constexpr int MAX_SERVO_RANGE = 512;  // 45° = 45 * (4096/360) ≈ 512
     c.servo_range = std::min(c.servo_range, MAX_SERVO_RANGE);
     c.servo_min   = std::max(c.servo_min, c.servo_center - MAX_SERVO_RANGE);
     c.servo_max   = std::min(c.servo_max, c.servo_center + MAX_SERVO_RANGE);

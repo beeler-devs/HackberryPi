@@ -6,21 +6,21 @@
     "servo_id": 1,
 
     "servo_center": 2048,
-    "servo_min": 1365,
-    "servo_max": 2731,
-    "servo_range": 683,
+    "servo_min": 1536,
+    "servo_max": 2560,
+    "servo_range": 512,
 
-    "pid_to_pos_scale": 2.0,
+    "pid_to_pos_scale": 1.0,
 
     "smooth_enabled": true,
-    "smooth_divisor": 2,
+    "smooth_divisor": 3,
 
     "torque_refresh_every": 512,
 
-    "kp_flick": 4.0,
-    "kd_flick": 8.0,
+    "kp_flick": 2.5,
+    "kd_flick": 6.0,
 
-    "kp_settle": 14.0,
+    "kp_settle": 16.0,
     "ki_settle": 0.05,
     "kd_settle": 7.0,
 

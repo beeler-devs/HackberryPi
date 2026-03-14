@@ -45,6 +45,10 @@ C++: pigpio, pthreads, librt — compiled with `-O3 -march=native -std=c++17`
 
 Servo serial: uses POSIX `termios` + `write()` — no additional library needed.
 
+## Change Policy
+
+**Prefer `config.json` over code changes.** If a tuning or behavior change can be made solely via `config.json`, do that instead of editing source files. Only modify `control_node.cpp` or `vision_node.py` when the change requires new logic or structural changes that config alone can't express.
+
 ## Key Architecture Decisions
 
 ### Servo Control — Feetech SCS/STS Serial Protocol
