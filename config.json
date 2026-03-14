@@ -18,21 +18,22 @@
     "torque_refresh_every": 512,
 
     "kp_flick": 4.0,
-    "kd_flick": 6.0,
+    "kd_flick": 8.0,
 
-    "kp_settle": 10.0,
-    "ki_settle": 0.40,
+    "kp_settle": 14.0,
+    "ki_settle": 0.05,
     "kd_settle": 7.0,
 
     "integral_clamp": 150.0,
 
     "flick_threshold_px": 60.0,
     "activation_range_px": 1000.0,
-    "fire_threshold_px": 5.0,
+    "fire_threshold_px": 15.0,
     "target_switch_px": 50.0,
 
     "trigger_min_ms": 80,
     "trigger_range_ms": 20,
+    "trigger_cooldown_ms": 100,
 
     "udp_port": 5005,
 

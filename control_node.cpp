@@ -110,6 +110,7 @@ struct Config {
     // Trigger
     int trigger_min_ms   = 30;
     int trigger_range_ms = 30;
+    int trigger_cooldown_ms = 500;  // minimum time between successive fires
 
     // Network
     int udp_port = 5005;
@@ -239,6 +240,7 @@ static bool load_config(const char* path, Config& c) {
     get_float("target_switch_px",   c.target_switch_px);
     get_int  ("trigger_min_ms",     c.trigger_min_ms);
     get_int  ("trigger_range_ms",   c.trigger_range_ms);
+    get_int  ("trigger_cooldown_ms", c.trigger_cooldown_ms);
     get_int  ("udp_port",           c.udp_port);
     get_long ("loop_period_ns",     c.loop_period_ns);
 
@@ -587,23 +589,31 @@ static int smooth_servo_position(ServoState& ss, int target_pos) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 static std::atomic<bool> trigger_active{false};
+static std::atomic<uint64_t> last_fire_time_us{0};
 
 static void maybe_fire() {
+    // Enforce cooldown between fires to prevent continuous re-energizing
+    uint64_t now_us = static_cast<uint64_t>(gpioTick());
+    uint64_t cooldown_us = static_cast<uint64_t>(cfg.trigger_cooldown_ms) * 1000;
+    uint64_t last = last_fire_time_us.load(std::memory_order_relaxed);
+    if (now_us - last < cooldown_us && last != 0) return;
+
     if (trigger_active.exchange(true)) return;
 
+    last_fire_time_us.store(now_us, std::memory_order_relaxed);
     std::printf("[DEBUG] Solenoid firing\n");
     std::fflush(stdout);
 
     std::thread([]() {
-        gpioWrite(cfg.pin_trigger, 1);
         unsigned dwell_us = static_cast<unsigned>(
             (cfg.trigger_min_ms + (std::rand() % (cfg.trigger_range_ms + 1))) * 1000
         );
+        gpioWrite(cfg.pin_trigger, 1);
         gpioDelay(dwell_us);
         gpioWrite(cfg.pin_trigger, 0);
         std::printf("[DEBUG] Solenoid released (dwell=%u ms)\n", dwell_us / 1000);
         std::fflush(stdout);
-        trigger_active.store(false);
+        trigger_active.store(false, std::memory_order_release);
     }).detach();
 }
 
